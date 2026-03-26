@@ -1,4 +1,11 @@
-node_modules
-dist
+node_modules/
+dist/
 .env
+.claude/
+tmp/
+data/memory/
+data/logs/
+*.js
+*.js.map
+*.d.ts
 .DS_Store

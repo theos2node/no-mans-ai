@@ -1,39 +1,36 @@
 {
   "name": "no-mans-ai",
   "version": "0.1.0",
-  "description": "Two-character Smallville-style prototype powered by GPT-5 Nano",
-  "scripts": {
-    "dev": "concurrently -k -n server,client -c magenta,cyan \"npm run dev:server\" \"npm run dev:client\"",
-    "dev:server": "tsx watch server/index.ts",
-    "dev:client": "vite",
-    "build": "vite build",
-    "check": "tsc --noEmit",
-    "start": "tsx server/index.ts"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "description": "Office simulation prototype",
   "private": true,
-  "type": "module",
-  "dependencies": {
-    "cors": "^2.8.6",
-    "dotenv": "^17.3.1",
-    "express": "^5.2.1",
-    "openai": "^6.32.0",
-    "react": "^19.2.4",
-    "react-dom": "^19.2.4",
-    "zod": "^4.3.6"
+  "scripts": {
+    "api": "node src/api/server.ts",
+    "dev": "vite",
+    "build": "vite build",
+    "build:sprites": "node scripts/build-sprites.mjs",
+    "check": "tsc --noEmit",
+    "preview": "vite preview"
   },
-  "devDependencies": {
-    "@types/cors": "^2.8.19",
-    "@types/express": "^5.0.6",
-    "@types/node": "^25.5.0",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.1",
-    "concurrently": "^9.2.1",
-    "tsx": "^4.21.0",
-    "typescript": "^5.9.3",
-    "vite": "^8.0.1"
+    "chalk": "^4.1.2",
+    "dotenv": "^17.3.1",
+    "openai": "^4.80.0",
+    "ora": "^5.4.1",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "uuid": "^11.1.0",
+    "vite": "^8.0.2",
+    "yaml": "^2.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/uuid": "^10.0.0",
+    "pngjs": "^7.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
   }
 }

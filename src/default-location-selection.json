@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "mapWidth": 3464,
+  "mapHeight": 1184,
+  "cellSize": 28,
+  "selectedCells": [
+    { "index": 1745, "col": 9, "row": 14, "walkable": false },
+    { "index": 1974, "col": 114, "row": 15, "walkable": true },
+    { "index": 2321, "col": 89, "row": 18, "walkable": false },
+    { "index": 2329, "col": 97, "row": 18, "walkable": true },
+    { "index": 2525, "col": 45, "row": 20, "walkable": false },
+    { "index": 2533, "col": 53, "row": 20, "walkable": false },
+    { "index": 3065, "col": 89, "row": 24, "walkable": false },
+    { "index": 3393, "col": 45, "row": 27, "walkable": false },
+    { "index": 3401, "col": 53, "row": 27, "walkable": false },
+    { "index": 3731, "col": 11, "row": 30, "walkable": false },
+    { "index": 3916, "col": 72, "row": 31, "walkable": false },
+    { "index": 4048, "col": 80, "row": 32, "walkable": false },
+    { "index": 4054, "col": 86, "row": 32, "walkable": false }
+  ]
+}

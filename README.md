@@ -1,53 +1,41 @@
 # No Man's AI
 
-A minimal Smallville-style social simulation with two autonomous residents:
+Pixel-office simulation prototype with a full-screen map, animated staff, a dashboard view, and a visual settings panel for editing the active routing grid and location anchors.
 
-- Sam, powered by `gpt-5-nano`
-- Jeremy, powered by `gpt-5-nano`
+## Current App
 
-The app runs a compact town with four locations. Each simulation tick, the characters choose one action, generate or store a memory, and react to each other through movement, observation, reflection, or dialogue.
+- full-screen office view with animated characters
+- dashboard view with profile cards and live status text
+- runtime controls for `Run`, `Pause`, `Test`, and `Live` / `Not live`
+- settings panel with:
+  - live grid overlay
+  - copy/apply grid selection
+  - reveal locations
+  - manual location placement on exact cells
 
-## Stack
+## Main Files
 
-- React + Vite frontend
-- Express simulation server
-- OpenAI Responses API for live character decisions
-- Structured outputs with Zod for reliable action parsing
+```text
+src/App.tsx
+src/main.tsx
+src/styles.css
+src/officeNavigation.ts
+src/default-grid-selection.json
+src/default-location-selection.json
+src/api/server.ts
+```
 
-## Run it
+## Run
 
-1. Install dependencies:
+```bash
+npm install
+npm run dev
+```
 
-   ```bash
-   npm install
-   ```
-
-2. Add environment variables:
-
-   ```bash
-   cp .env.example .env
-   ```
-
-3. Set `OPENAI_API_KEY` in `.env` if you want live model behavior.
-
-4. Start the app:
-
-   ```bash
-   npm run dev
-   ```
-
-5. Open `http://localhost:5173`.
-
-If no API key is present, the simulation still works in mock mode with deterministic fallback behavior.
-
-## API
-
-- `GET /api/state`
-- `POST /api/step`
-- `POST /api/reset`
+Then open [http://localhost:5173](http://localhost:5173).
 
 ## Notes
 
-- The backend uses the Responses API with `gpt-5-nano`.
-- Character turns are requested as structured JSON, then applied to a shared simulation state.
-- This is intentionally small and readable so you can extend it into a richer Smallville-style environment next.
+- The office UI is the active product surface in this repo.
+- The old Riverside Pottery Studio simulation scaffold has been removed.
+- The API bridge reports runtime status for the current app and no longer launches the deleted legacy simulation.
