@@ -3,16 +3,16 @@ import 'dotenv/config';
 import http, { type IncomingMessage, type ServerResponse } from 'http';
 
 import {
+  createLivePlannerConfig,
+  createRunnerMeta,
   OfficeSimulationEngine,
   type DashboardEvent,
   type EmployeeSyncPayload,
-  type RunnerMeta,
 } from './simulationEngine.ts';
 
 const PORT = Number(process.env.PORT ?? 8787);
-const META: RunnerMeta = {
-  live: Boolean(process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY),
-};
+const planner = createLivePlannerConfig();
+const META = createRunnerMeta(planner);
 
 function sendJson(response: ServerResponse, statusCode: number, payload: unknown): void {
   response.writeHead(statusCode, {
@@ -36,7 +36,7 @@ async function readJsonBody<T>(request: IncomingMessage): Promise<T> {
   return JSON.parse(body || '{}') as T;
 }
 
-const runtime = new OfficeSimulationEngine({ live: META.live });
+const runtime = new OfficeSimulationEngine({ planner });
 const clients = new Set<ServerResponse>();
 
 runtime.subscribe((event) => {

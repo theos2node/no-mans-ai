@@ -28,6 +28,7 @@ export type OfficeLocationId =
   | 'general-manager';
 
 export type EmployeePhase = 'idle' | 'moving' | 'working' | 'paused';
+export type PlannerTransport = 'local' | 'direct' | 'proxy';
 
 export interface DashboardStatus {
   state: RunState;
@@ -51,9 +52,12 @@ export interface LogEntry {
 
 export interface RunnerMeta {
   live: boolean;
+  transport: PlannerTransport;
+  model: string | null;
 }
 
 export interface UsageSnapshot {
+  requestCount: number;
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
@@ -86,6 +90,40 @@ interface TaskPlan {
   stops: PlanStop[];
 }
 
+export interface LivePlannerConfig {
+  apiKey: string;
+  baseUrl: string;
+  model: string;
+  transport: Exclude<PlannerTransport, 'local'>;
+  inputCostPer1M: number;
+  outputCostPer1M: number;
+}
+
+interface ModelPricing {
+  inputCostPer1M: number;
+  outputCostPer1M: number;
+}
+
+interface PlannerChatResponse {
+  choices?: Array<{
+    message?: {
+      content?: unknown;
+    };
+  }>;
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+    input_tokens?: number;
+    output_tokens?: number;
+  };
+}
+
+interface LivePlanPayload {
+  title: string;
+  stops: PlanStop[];
+}
+
 interface EmployeeRuntimeRecord extends EmployeeSeed {
   currentLocationId: OfficeLocationId;
   targetLocationId: OfficeLocationId | null;
@@ -97,6 +135,8 @@ interface EmployeeRuntimeRecord extends EmployeeSeed {
   currentStopIndex: number;
   planVersion: number;
   lastUpdatedAt: string;
+  planning: boolean;
+  plannerRequestToken: number;
 }
 
 export interface EmployeeRuntimeState extends EmployeeSeed {
@@ -109,6 +149,7 @@ export interface EmployeeRuntimeState extends EmployeeSeed {
   scriptQueue: OfficeLocationId[];
   planVersion: number;
   lastUpdatedAt: string;
+  planning: boolean;
 }
 
 export interface EmployeeSnapshot {
@@ -129,6 +170,17 @@ export interface EmployeeSyncPayload {
 
 const ENGINE_TICK_MS = 2200;
 const MAX_LOG_ENTRIES = 240;
+const DEFAULT_OPENAI_BASE_URL = 'https://api.openai.com/v1';
+const DEFAULT_OPENAI_MODEL = 'gpt-5-nano';
+const PLANNER_MAX_TOKENS = 260;
+const PLANNER_TEMPERATURE = 0.7;
+
+const MODEL_PRICING_TABLE: Array<{ match: RegExp; pricing: ModelPricing }> = [
+  { match: /^gpt-5(?:\.\d+)?$/i, pricing: { inputCostPer1M: 1.25, outputCostPer1M: 10 } },
+  { match: /^gpt-5-mini$/i, pricing: { inputCostPer1M: 0.25, outputCostPer1M: 2 } },
+  { match: /^gpt-5-nano$/i, pricing: { inputCostPer1M: 0.05, outputCostPer1M: 0.4 } },
+  { match: /^gpt-4o-mini$/i, pricing: { inputCostPer1M: 0.15, outputCostPer1M: 0.6 } },
+];
 
 export const officeLocationIds: OfficeLocationId[] = [
   'break-room',
@@ -144,6 +196,8 @@ export const officeLocationIds: OfficeLocationId[] = [
   'quality-inspector',
   'general-manager',
 ];
+
+const officeLocationIdSet = new Set<OfficeLocationId>(officeLocationIds);
 
 const officeLocationLabels: Record<OfficeLocationId, string> = {
   'break-room': 'Break Room',
@@ -277,11 +331,200 @@ function createEmployeeState(seed: EmployeeSeed): EmployeeRuntimeRecord {
     currentStopIndex: 0,
     planVersion: 0,
     lastUpdatedAt: nowIso(),
+    planning: false,
+    plannerRequestToken: 0,
   };
 }
 
 function randomFrom<T>(items: readonly T[]) {
   return items[Math.floor(Math.random() * items.length)] ?? items[0];
+}
+
+function trimmedEnvValue(value: string | undefined) {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : null;
+}
+
+function normalizeBaseUrl(baseUrl: string | null) {
+  return (baseUrl ?? DEFAULT_OPENAI_BASE_URL).replace(/\/+$/, '');
+}
+
+function buildChatCompletionsUrl(baseUrl: string) {
+  return baseUrl.endsWith('/chat/completions') ? baseUrl : `${baseUrl}/chat/completions`;
+}
+
+function defaultPricingForModel(model: string): ModelPricing {
+  const match = MODEL_PRICING_TABLE.find((entry) => entry.match.test(model));
+  return match?.pricing ?? { inputCostPer1M: 0, outputCostPer1M: 0 };
+}
+
+function parseUsdRate(value: string | undefined, fallback: number) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function inferTransport(baseUrl: string) {
+  return /api\.openai\.com/i.test(baseUrl) ? 'direct' : 'proxy';
+}
+
+function shortError(error: unknown) {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return typeof error === 'string' ? error : 'Unknown error';
+}
+
+function extractAssistantText(content: unknown): string {
+  if (typeof content === 'string') {
+    return content;
+  }
+
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === 'string') {
+          return part;
+        }
+        if (part && typeof part === 'object' && 'text' in part && typeof part.text === 'string') {
+          return part.text;
+        }
+        return '';
+      })
+      .join('\n')
+      .trim();
+  }
+
+  return '';
+}
+
+function extractJsonObject(text: string) {
+  const trimmed = text.trim();
+  const withoutFence = trimmed.replace(/^```json\s*/i, '').replace(/^```/, '').replace(/```$/i, '').trim();
+  try {
+    return JSON.parse(withoutFence) as unknown;
+  } catch {
+    const firstBrace = withoutFence.indexOf('{');
+    const lastBrace = withoutFence.lastIndexOf('}');
+    if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
+      throw new Error('Planner response did not contain JSON.');
+    }
+    return JSON.parse(withoutFence.slice(firstBrace, lastBrace + 1)) as unknown;
+  }
+}
+
+function sanitizeLivePlanPayload(payload: unknown, fallbackLocationId: OfficeLocationId): LivePlanPayload | null {
+  if (!payload || typeof payload !== 'object') {
+    return null;
+  }
+
+  const candidate = payload as { title?: unknown; stops?: unknown };
+  const title = typeof candidate.title === 'string' && candidate.title.trim() ? candidate.title.trim() : 'Live Plan';
+
+  if (!Array.isArray(candidate.stops)) {
+    return null;
+  }
+
+  const stops = candidate.stops
+    .map((stop) => {
+      if (!stop || typeof stop !== 'object') {
+        return null;
+      }
+
+      const parsedStop = stop as { locationId?: unknown; stepLabel?: unknown };
+      if (typeof parsedStop.locationId !== 'string' || !officeLocationIdSet.has(parsedStop.locationId as OfficeLocationId)) {
+        return null;
+      }
+
+      const stepLabel = typeof parsedStop.stepLabel === 'string' && parsedStop.stepLabel.trim() ? parsedStop.stepLabel.trim() : null;
+      if (!stepLabel) {
+        return null;
+      }
+
+      return {
+        locationId: parsedStop.locationId as OfficeLocationId,
+        stepLabel,
+      };
+    })
+    .filter((stop): stop is PlanStop => Boolean(stop))
+    .slice(0, 3);
+
+  if (stops.length === 0) {
+    return {
+      title,
+      stops: [
+        {
+          locationId: fallbackLocationId,
+          stepLabel: 'Review queue',
+        },
+      ],
+    };
+  }
+
+  return { title, stops };
+}
+
+function readUsageTotals(payload: unknown) {
+  if (!payload || typeof payload !== 'object') {
+    return { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+  }
+
+  const usage = payload as {
+    prompt_tokens?: unknown;
+    completion_tokens?: unknown;
+    total_tokens?: unknown;
+    input_tokens?: unknown;
+    output_tokens?: unknown;
+  };
+
+  const inputTokens = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0);
+  const outputTokens = Number(usage.completion_tokens ?? usage.output_tokens ?? 0);
+  const totalTokens = Number(usage.total_tokens ?? inputTokens + outputTokens);
+
+  return {
+    inputTokens: Number.isFinite(inputTokens) ? Math.max(0, inputTokens) : 0,
+    outputTokens: Number.isFinite(outputTokens) ? Math.max(0, outputTokens) : 0,
+    totalTokens: Number.isFinite(totalTokens) ? Math.max(0, totalTokens) : 0,
+  };
+}
+
+function estimateCostUsd(usage: Pick<UsageSnapshot, 'inputTokens' | 'outputTokens'>, planner: LivePlannerConfig | null) {
+  if (!planner) {
+    return 0;
+  }
+
+  const estimatedCost =
+    usage.inputTokens * (planner.inputCostPer1M / 1_000_000) +
+    usage.outputTokens * (planner.outputCostPer1M / 1_000_000);
+
+  return Number(estimatedCost.toFixed(6));
+}
+
+export function createLivePlannerConfig(env: NodeJS.ProcessEnv = process.env): LivePlannerConfig | null {
+  const apiKey = trimmedEnvValue(env.OPENAI_API_KEY);
+  if (!apiKey) {
+    return null;
+  }
+
+  const model = trimmedEnvValue(env.OPENAI_MODEL) ?? trimmedEnvValue(env.TEST_LAN_PROXY_MODEL) ?? DEFAULT_OPENAI_MODEL;
+  const baseUrl = normalizeBaseUrl(trimmedEnvValue(env.OPENAI_BASE_URL));
+  const defaults = defaultPricingForModel(model);
+
+  return {
+    apiKey,
+    baseUrl,
+    model,
+    transport: inferTransport(baseUrl),
+    inputCostPer1M: parseUsdRate(env.OPENAI_INPUT_COST_PER_1M, defaults.inputCostPer1M),
+    outputCostPer1M: parseUsdRate(env.OPENAI_OUTPUT_COST_PER_1M, defaults.outputCostPer1M),
+  };
+}
+
+export function createRunnerMeta(planner: LivePlannerConfig | null): RunnerMeta {
+  return {
+    live: Boolean(planner),
+    transport: planner?.transport ?? 'local',
+    model: planner?.model ?? null,
+  };
 }
 
 function defaultPlansFor(seed: EmployeeSeed): TaskPlan[] {
@@ -404,11 +647,13 @@ function buildRandomTestPlan(seed: EmployeeSeed): TaskPlan {
 export class OfficeSimulationEngine {
   private readonly listeners = new Set<(event: DashboardEvent) => void>();
   private readonly employees = new Map(employeeSeeds.map((seed) => [seed.id, createEmployeeState(seed)] as const));
-  private readonly live: boolean;
+  private readonly planner: LivePlannerConfig | null;
+  private readonly meta: RunnerMeta;
   private interval: NodeJS.Timeout | null = null;
   private tickCount = 0;
   private logs: LogEntry[] = [];
   private usage: UsageSnapshot = {
+    requestCount: 0,
     inputTokens: 0,
     outputTokens: 0,
     totalTokens: 0,
@@ -423,8 +668,13 @@ export class OfficeSimulationEngine {
     pid: null,
   };
 
-  constructor(options?: { live?: boolean }) {
-    this.live = Boolean(options?.live);
+  constructor(options?: { planner?: LivePlannerConfig | null }) {
+    this.planner = options?.planner ?? null;
+    this.meta = createRunnerMeta(this.planner);
+  }
+
+  getRunnerMeta(): RunnerMeta {
+    return { ...this.meta };
   }
 
   subscribe(listener: (event: DashboardEvent) => void): () => void {
@@ -443,7 +693,7 @@ export class OfficeSimulationEngine {
 
   getEmployeeSnapshot(): EmployeeSnapshot {
     return {
-      mode: this.live ? 'live' : 'local',
+      mode: this.meta.live ? 'live' : 'local',
       tick: this.tickCount,
       employees: [...this.employees.values()].map((employee) => ({
         id: employee.id,
@@ -462,6 +712,7 @@ export class OfficeSimulationEngine {
         scriptQueue: employee.targetLocationId ? [employee.targetLocationId] : [],
         planVersion: employee.planVersion,
         lastUpdatedAt: employee.lastUpdatedAt,
+        planning: employee.planning,
       })),
       usage: { ...this.usage },
     };
@@ -496,8 +747,8 @@ export class OfficeSimulationEngine {
     this.ensureInterval();
     this.tick();
     this.pushSystemLog(
-      this.live
-        ? 'Live office simulation started. Employees will request live planning once a planner is connected.'
+      this.meta.live
+        ? `${this.meta.transport === 'proxy' ? 'Proxy' : 'Direct'} office simulation started on ${this.meta.model ?? DEFAULT_OPENAI_MODEL}.`
         : 'Local office simulation started. Employees are running scripted backend logic.',
     );
     this.broadcast({ type: 'status', payload: this.status });
@@ -522,6 +773,8 @@ export class OfficeSimulationEngine {
     };
 
     for (const employee of this.employees.values()) {
+      employee.planning = false;
+      employee.plannerRequestToken += 1;
       employee.phase = 'paused';
       employee.status = `Paused at ${locationLabel(employee.currentLocationId)}`;
       employee.lastUpdatedAt = nowIso();
@@ -549,6 +802,7 @@ export class OfficeSimulationEngine {
       pid: null,
     };
     this.usage = {
+      requestCount: 0,
       inputTokens: 0,
       outputTokens: 0,
       totalTokens: 0,
@@ -576,6 +830,8 @@ export class OfficeSimulationEngine {
     this.ensureInterval();
 
     for (const employee of this.employees.values()) {
+      employee.planning = false;
+      employee.plannerRequestToken += 1;
       this.applyPlan(employee, buildRandomTestPlan(employee), true);
     }
 
@@ -651,10 +907,22 @@ export class OfficeSimulationEngine {
       return;
     }
 
-    if (employee.phase === 'idle') {
-      const plans = defaultPlansFor(employee);
-      this.applyPlan(employee, randomFrom(plans), false);
+    if (employee.phase !== 'idle') {
+      return;
     }
+
+    if (employee.planning) {
+      employee.status = `Waiting for ${this.meta.transport === 'proxy' ? 'proxy' : 'live'} plan`;
+      return;
+    }
+
+    if (this.planner) {
+      void this.requestLivePlan(employee.id);
+      return;
+    }
+
+    const plans = defaultPlansFor(employee);
+    this.applyPlan(employee, randomFrom(plans), false);
   }
 
   private advanceWork(employee: EmployeeRuntimeRecord) {
@@ -698,6 +966,7 @@ export class OfficeSimulationEngine {
   }
 
   private applyPlan(employee: EmployeeRuntimeRecord, plan: TaskPlan, scripted: boolean) {
+    employee.planning = false;
     employee.currentPlan = plan;
     employee.currentStopIndex = 0;
     employee.taskTitle = plan.title;
@@ -751,6 +1020,11 @@ export class OfficeSimulationEngine {
   }
 
   private refreshStatus(employee: EmployeeRuntimeRecord) {
+    if (employee.planning) {
+      employee.status = `Waiting for ${this.meta.transport === 'proxy' ? 'proxy' : 'live'} plan`;
+      return;
+    }
+
     if (employee.phase === 'moving' && employee.targetLocationId) {
       employee.status = `Walking to ${locationLabel(employee.targetLocationId)}`;
       return;
@@ -762,6 +1036,143 @@ export class OfficeSimulationEngine {
     }
 
     employee.status = `Holding at ${locationLabel(employee.currentLocationId)}`;
+  }
+
+  private async requestLivePlan(employeeId: EmployeeId) {
+    const employee = this.employees.get(employeeId);
+    if (!employee || !this.planner || employee.phase !== 'idle' || employee.planning || this.status.state !== 'running') {
+      return;
+    }
+
+    employee.planning = true;
+    employee.plannerRequestToken += 1;
+    const requestToken = employee.plannerRequestToken;
+    employee.status = `Waiting for ${this.meta.transport === 'proxy' ? 'proxy' : 'live'} plan`;
+    employee.lastUpdatedAt = nowIso();
+    this.broadcast({ type: 'employees', payload: this.getEmployeeSnapshot() });
+
+    try {
+      const plan = await this.fetchLivePlan(employee);
+      const current = this.employees.get(employeeId);
+      if (!current || current.plannerRequestToken !== requestToken) {
+        return;
+      }
+
+      current.planning = false;
+      current.lastUpdatedAt = nowIso();
+
+      if (this.status.state !== 'running' || current.phase !== 'idle') {
+        this.refreshStatus(current);
+        this.broadcast({ type: 'employees', payload: this.getEmployeeSnapshot() });
+        return;
+      }
+
+      this.pushSystemLog(`${current.name} received live plan "${plan.title}".`);
+      this.applyPlan(current, plan, false);
+      this.broadcast({ type: 'employees', payload: this.getEmployeeSnapshot() });
+    } catch (error) {
+      const current = this.employees.get(employeeId);
+      if (!current || current.plannerRequestToken !== requestToken) {
+        return;
+      }
+
+      current.planning = false;
+      current.lastUpdatedAt = nowIso();
+      this.pushSystemLog(`Live planner failed for ${current.name}: ${shortError(error)}. Falling back to scripted plan.`);
+
+      if (this.status.state === 'running' && current.phase === 'idle') {
+        this.applyPlan(current, randomFrom(defaultPlansFor(current)), false);
+      } else {
+        this.refreshStatus(current);
+      }
+
+      this.broadcast({ type: 'employees', payload: this.getEmployeeSnapshot() });
+    }
+  }
+
+  private async fetchLivePlan(employee: EmployeeRuntimeRecord): Promise<TaskPlan> {
+    if (!this.planner) {
+      throw new Error('Live planner is not configured.');
+    }
+
+    const planner = this.planner;
+    const messages = [
+      {
+        role: 'system',
+        content: [
+          'You are a task planner for a simulated office staff member.',
+          'Return raw JSON only.',
+          'Schema: {"title":"string","stops":[{"locationId":"one of the allowed ids","stepLabel":"short step"}]}',
+          'Use 2 to 3 stops.',
+          'Keep stepLabel concise.',
+          `Allowed location ids: ${officeLocationIds.join(', ')}`,
+        ].join(' '),
+      },
+      {
+        role: 'user',
+        content: [
+          `Employee: ${employee.name}`,
+          `Position: ${employee.position}`,
+          `Assigned location: ${employee.assignedLocationId} (${locationLabel(employee.assignedLocationId)})`,
+          `Current location: ${employee.currentLocationId} (${locationLabel(employee.currentLocationId)})`,
+          `Bio: ${employee.bio}`,
+          `Default checklist: ${employee.defaultChecklist.join('; ')}`,
+          'Generate a realistic next office task sequence.',
+        ].join('\n'),
+      },
+    ];
+
+    this.usage.requestCount += 1;
+
+    const response = await fetch(buildChatCompletionsUrl(planner.baseUrl), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${planner.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: planner.model,
+        temperature: PLANNER_TEMPERATURE,
+        max_tokens: PLANNER_MAX_TOKENS,
+        messages,
+      }),
+    });
+
+    const responseText = await response.text();
+    if (!response.ok) {
+      throw new Error(`Planner HTTP ${response.status}: ${responseText.slice(0, 220)}`);
+    }
+
+    let parsedResponse: PlannerChatResponse;
+    try {
+      parsedResponse = JSON.parse(responseText) as PlannerChatResponse;
+    } catch {
+      throw new Error('Planner returned invalid JSON.');
+    }
+
+    this.recordUsage(parsedResponse.usage);
+    const assistantText = extractAssistantText(parsedResponse.choices?.[0]?.message?.content);
+    const planPayload = sanitizeLivePlanPayload(extractJsonObject(assistantText), employee.assignedLocationId);
+
+    if (!planPayload) {
+      throw new Error('Planner response did not match the expected schema.');
+    }
+
+    return buildPlan(planPayload.title, planPayload.stops);
+  }
+
+  private recordUsage(rawUsage: unknown) {
+    const usageDelta = readUsageTotals(rawUsage);
+
+    this.usage = {
+      requestCount: this.usage.requestCount,
+      inputTokens: this.usage.inputTokens + usageDelta.inputTokens,
+      outputTokens: this.usage.outputTokens + usageDelta.outputTokens,
+      totalTokens: this.usage.totalTokens + usageDelta.totalTokens,
+      estimatedCostUsd: 0,
+    };
+
+    this.usage.estimatedCostUsd = estimateCostUsd(this.usage, this.planner);
   }
 
   private pushSystemLog(line: string) {

@@ -100,9 +100,12 @@ interface ApiRunnerSnapshot {
 
 interface ApiMeta {
   live: boolean;
+  transport: 'local' | 'direct' | 'proxy';
+  model: string | null;
 }
 
 interface ApiUsageSnapshot {
+  requestCount: number;
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
@@ -1030,6 +1033,7 @@ export default function App() {
   const [staffTest, setStaffTest] = useState<StaffTestState | null>(null);
   const [apiSnapshot, setApiSnapshot] = useState<ApiRunnerSnapshot | null>(null);
   const [employeeSnapshot, setEmployeeSnapshot] = useState<ApiEmployeeSnapshot | null>(null);
+  const [apiMeta, setApiMeta] = useState<ApiMeta | null>(null);
   const [apiConnected, setApiConnected] = useState(false);
   const [apiLive, setApiLive] = useState(false);
   const [selectedStaffId, setSelectedStaffId] = useState<string | null>(null);
@@ -1129,6 +1133,7 @@ export default function App() {
 
     async function fetchApiStatus() {
       try {
+        const fallbackMeta: ApiMeta = { live: false, transport: 'local', model: null };
         const [statusResponse, metaResponse, employeesResponse] = await Promise.all([
           fetch('/api/status'),
           fetch('/api/meta'),
@@ -1139,17 +1144,19 @@ export default function App() {
         }
 
         const snapshot = (await statusResponse.json()) as ApiRunnerSnapshot;
-        const meta = metaResponse.ok ? ((await metaResponse.json()) as ApiMeta) : { live: false };
+        const meta = metaResponse.ok ? ((await metaResponse.json()) as ApiMeta) : fallbackMeta;
         const employees = employeesResponse.ok ? ((await employeesResponse.json()) as ApiEmployeeSnapshot) : null;
 
         if (!cancelled) {
           setApiSnapshot(snapshot);
           setEmployeeSnapshot(employees);
+          setApiMeta(meta);
           setApiConnected(true);
           setApiLive(Boolean(meta.live));
         }
       } catch {
         if (!cancelled) {
+          setApiMeta(null);
           setApiConnected(false);
           setApiLive(false);
         }
@@ -1573,8 +1580,20 @@ export default function App() {
   const isTesting = world.testing || staffTest.testing;
   const runtimeBadgeLabel = apiLive ? 'Live' : 'Not live';
   const runtimeBadgeClass = apiLive ? 'is-live' : 'is-local';
+  const dashboardRequests = employeeSnapshot ? employeeSnapshot.usage.requestCount.toLocaleString() : apiConnected && apiLive ? '--' : '0';
   const dashboardTokens = employeeSnapshot ? employeeSnapshot.usage.totalTokens.toLocaleString() : apiConnected && apiLive ? '--' : '0';
   const dashboardCost = employeeSnapshot ? `$${employeeSnapshot.usage.estimatedCostUsd.toFixed(2)}` : apiConnected && apiLive ? '--' : '$0.00';
+  const transportLabel =
+    apiMeta?.transport === 'proxy'
+      ? `Proxy${apiMeta.model ? ` · ${apiMeta.model}` : ''}`
+      : apiMeta?.transport === 'direct'
+        ? `Direct${apiMeta.model ? ` · ${apiMeta.model}` : ''}`
+        : 'Local scripted';
+  const runtimeUsageLabel = employeeSnapshot
+    ? `${employeeSnapshot.usage.requestCount.toLocaleString()} req · ${employeeSnapshot.usage.totalTokens.toLocaleString()} tok · $${employeeSnapshot.usage.estimatedCostUsd.toFixed(4)}`
+    : apiConnected && apiLive
+      ? '-- req · -- tok · --'
+      : '0 req · 0 tok · $0.0000';
   const runnerStatus = apiSnapshot?.status.state ?? localRunState;
   const shouldShowGrid = settingsOpen && settingsSection === 'grid' && view === 'office';
   const shouldShowLocationEditor = settingsOpen && settingsSection === 'locations' && view === 'office';
@@ -1680,6 +1699,9 @@ export default function App() {
         <button className={`runtime-button live-button ${runtimeBadgeClass}`} disabled type="button">
           {runtimeBadgeLabel}
         </button>
+        <div aria-live="polite" className="runtime-usage">
+          {runtimeUsageLabel}
+        </div>
       </div>
 
       {settingsOpen ? (
@@ -1838,7 +1860,11 @@ export default function App() {
             <div className="dashboard-metrics">
               <div className="metric-card">
                 <span className="metric-label">Mode</span>
-                <strong>{apiLive ? 'Live tokens enabled' : 'Local scripted test'}</strong>
+                <strong>{apiLive ? 'Live planner enabled' : 'Local scripted test'}</strong>
+              </div>
+              <div className="metric-card">
+                <span className="metric-label">Requests</span>
+                <strong>{dashboardRequests}</strong>
               </div>
               <div className="metric-card">
                 <span className="metric-label">Tokens Used</span>
@@ -1847,6 +1873,10 @@ export default function App() {
               <div className="metric-card">
                 <span className="metric-label">Estimated Cost</span>
                 <strong>{dashboardCost}</strong>
+              </div>
+              <div className="metric-card">
+                <span className="metric-label">Transport</span>
+                <strong>{transportLabel}</strong>
               </div>
               <div className="metric-card">
                 <span className="metric-label">Runner</span>

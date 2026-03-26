@@ -74,6 +74,14 @@ button {
   box-shadow: 0 18px 40px rgba(0, 0, 0, 0.28);
 }
 
+.runtime-usage {
+  color: rgba(244, 239, 219, 0.72);
+  font-family: 'Press Start 2P', monospace;
+  font-size: 0.42rem;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
 .nav-button,
 .runtime-button {
   min-height: 44px;
@@ -640,6 +648,11 @@ button {
     bottom: 10px;
     left: 10px;
     flex-wrap: wrap;
+  }
+
+  .runtime-usage {
+    width: 100%;
+    white-space: normal;
   }
 
   .nav-button,

@@ -8,6 +8,8 @@ Pixel-office simulation prototype with a full-screen map, animated staff, a dash
 - dashboard view with profile cards and live status text
 - runtime controls for `Run`, `Pause`, `Test`, and `Live` / `Not live`
 - backend simulation engine for employee task state, phase progression, and route assignment
+- OpenAI-compatible proxy support via `OPENAI_BASE_URL`
+- live usage tracking for request count, tokens, and estimated cost
 - settings panel with:
   - live grid overlay
   - copy/apply grid selection
@@ -38,6 +40,26 @@ npm run dev
 Then open [http://localhost:5173](http://localhost:5173).
 
 The API server runs on [http://localhost:8787](http://localhost:8787).
+
+## Live Proxy Config
+
+Use these env vars for live planning:
+
+```bash
+OPENAI_API_KEY=...
+OPENAI_BASE_URL=...
+OPENAI_MODEL=gpt-5-nano
+OPENAI_INPUT_COST_PER_1M=
+OPENAI_OUTPUT_COST_PER_1M=
+```
+
+Notes:
+
+- `OPENAI_BASE_URL` can point to an OpenAI-compatible proxy such as GPT2api.
+- If `OPENAI_MODEL` is unset, the backend also checks `TEST_LAN_PROXY_MODEL` as a local fallback.
+- `Run` uses the live planner when those env vars are set.
+- `Test` stays local and scripted so you can verify movement without spending tokens.
+- Estimated cost uses model defaults when known and can be overridden with the `OPENAI_*_COST_PER_1M` vars.
 
 ## API
 
