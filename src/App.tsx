@@ -69,6 +69,7 @@ interface RouteState {
   currentLocationId: string | null;
   path: number[];
   scriptQueue: string[];
+  backendPlanVersion: number;
 }
 
 interface WorldState {
@@ -114,11 +115,14 @@ interface ApiEmployeeState {
   position: string;
   assignedLocationId: string;
   currentLocationId: string;
+  targetLocationId: string | null;
+  phase: string;
   bio: string;
   status: string;
   taskTitle: string;
   checklist: string[];
   scriptQueue: string[];
+  planVersion: number;
   lastUpdatedAt: string;
 }
 
@@ -131,9 +135,6 @@ interface ApiEmployeeSnapshot {
 interface EmployeeSyncEntry {
   id: string;
   currentLocationId: string;
-  status: string;
-  taskTitle: string;
-  checklist: string[];
 }
 
 interface GridCell {
@@ -496,6 +497,7 @@ function createRouteState(grid: NavigationGrid, point: { x: number; y: number },
     currentLocationId,
     path: [],
     scriptQueue: [],
+    backendPlanVersion: 0,
   };
 }
 
@@ -550,6 +552,7 @@ function remapWorldToGrid(world: WorldState, grid: NavigationGrid, locations: Of
       path: [],
       scriptQueue: [],
       frameIndex: idleFrame(actor.direction),
+      backendPlanVersion: actor.backendPlanVersion,
     };
   }
 
@@ -582,6 +585,7 @@ function remapStaffTestToGrid(current: StaffTestState, grid: NavigationGrid, loc
           path: [],
           scriptQueue: [],
           frameIndex: idleFrame(existing?.direction ?? profile.direction),
+          backendPlanVersion: existing?.backendPlanVersion ?? 0,
         },
       ] as const;
     }),
@@ -948,44 +952,73 @@ function buildEmployeeSyncEntries(
   world: WorldState,
   staffTest: StaffTestState,
   locations: OfficeLocation[],
-  snapshot: ApiEmployeeSnapshot | null,
 ) {
   const entries: EmployeeSyncEntry[] = [
     {
       id: 'sam',
       currentLocationId: world.actors.sam.currentLocationId ?? actorProfiles.sam.startLocationId,
-      status: actorStatusText(world.actors.sam, locations),
-      taskTitle: employeeById(snapshot, 'sam')?.taskTitle ?? actorProfiles.sam.thought.title,
-      checklist: employeeById(snapshot, 'sam')?.checklist ?? actorProfiles.sam.thought.checklist,
     },
     {
       id: 'jeremy',
       currentLocationId: world.actors.jeremy.currentLocationId ?? actorProfiles.jeremy.startLocationId,
-      status: actorStatusText(world.actors.jeremy, locations),
-      taskTitle: employeeById(snapshot, 'jeremy')?.taskTitle ?? actorProfiles.jeremy.thought.title,
-      checklist: employeeById(snapshot, 'jeremy')?.checklist ?? actorProfiles.jeremy.thought.checklist,
     },
   ];
 
   for (const staff of fixedStaffProfiles) {
     const mover = staffTest.movers[staff.id];
-    const backendEmployee = employeeById(snapshot, staff.id);
 
     entries.push({
       id: staff.id,
       currentLocationId: mover?.currentLocationId ?? staff.locationId,
-      status: staffStatusText(mover, staff, locations),
-      taskTitle: backendEmployee?.taskTitle ?? staff.position,
-      checklist:
-        backendEmployee?.checklist ?? [
-          staffStatusText(mover, staff, locations),
-          `Assigned to ${staff.position}`,
-          `Stationed at ${locationById(staff.locationId, locations)?.label ?? staff.position}`,
-        ],
     });
   }
 
   return entries;
+}
+
+function reconcileRouteWithBackend(
+  route: RouteState,
+  employee: ApiEmployeeState | null,
+  grid: NavigationGrid,
+  point: { x: number; y: number } | null,
+) {
+  if (!employee) {
+    return route;
+  }
+
+  if (employee.planVersion <= route.backendPlanVersion) {
+    return route;
+  }
+
+  if (route.nextCell !== null || route.destinationId !== null || route.scriptQueue.length > 0) {
+    return route;
+  }
+
+  if (!point) {
+    return {
+      ...route,
+      currentLocationId: employee.currentLocationId,
+      backendPlanVersion: employee.planVersion,
+    };
+  }
+
+  const cell = closestWalkableIndex(grid, point);
+  const center = cellCenter(grid, cell);
+
+  return {
+    ...route,
+    cell,
+    nextCell: null,
+    moveProgress: 0,
+    x: center.x,
+    y: center.y,
+    destinationId: null,
+    currentLocationId: employee.currentLocationId,
+    path: [],
+    scriptQueue: [...employee.scriptQueue],
+    frameIndex: idleFrame(route.direction),
+    backendPlanVersion: employee.planVersion,
+  };
 }
 
 export default function App() {
@@ -1126,7 +1159,7 @@ export default function App() {
     void fetchApiStatus();
     const intervalId = window.setInterval(() => {
       void fetchApiStatus();
-    }, 5000);
+    }, 1500);
 
     return () => {
       cancelled = true;
@@ -1135,13 +1168,72 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!employeeSnapshot || !navigation || !world || !staffTest) {
+      return;
+    }
+
+    setWorld((current) => {
+      if (!current) {
+        return current;
+      }
+
+      const samEmployee = employeeById(employeeSnapshot, 'sam');
+      const jeremyEmployee = employeeById(employeeSnapshot, 'jeremy');
+
+      return {
+        ...current,
+        actors: {
+          sam: reconcileRouteWithBackend(
+            current.actors.sam,
+            samEmployee,
+            navigation,
+            locationById(samEmployee?.currentLocationId ?? '', locations)?.targets.sam ?? null,
+          ),
+          jeremy: reconcileRouteWithBackend(
+            current.actors.jeremy,
+            jeremyEmployee,
+            navigation,
+            locationById(jeremyEmployee?.currentLocationId ?? '', locations)?.targets.jeremy ?? null,
+          ),
+        },
+      };
+    });
+
+    setStaffTest((current) => {
+      if (!current) {
+        return current;
+      }
+
+      const movers = Object.fromEntries(
+        fixedStaffProfiles.map((profile) => {
+          const employee = employeeById(employeeSnapshot, profile.id);
+          return [
+            profile.id,
+            reconcileRouteWithBackend(
+              current.movers[profile.id],
+              employee,
+              navigation,
+              locationById(employee?.currentLocationId ?? '', locations)?.marker ?? null,
+            ),
+          ] as const;
+        }),
+      ) as Record<string, RouteState>;
+
+      return {
+        ...current,
+        movers,
+      };
+    });
+  }, [employeeSnapshot, locations, navigation]);
+
+  useEffect(() => {
     if (!apiConnected || !world || !staffTest) {
       return;
     }
 
     const timeoutId = window.setTimeout(() => {
       const payload = {
-        employees: buildEmployeeSyncEntries(world, staffTest, locations, employeeSnapshot),
+        employees: buildEmployeeSyncEntries(world, staffTest, locations),
       };
 
       void fetch('/api/employees/sync', {
@@ -1240,8 +1332,18 @@ export default function App() {
   function handleRun() {
     setLocalRunState('running');
 
-    if (apiConnected && apiLive) {
-      void fetch('/api/start', { method: 'POST' }).catch(() => undefined);
+    if (apiConnected) {
+      void (async () => {
+        try {
+          await fetch('/api/start', { method: 'POST' });
+          const employeesResponse = await fetch('/api/employees');
+          if (employeesResponse.ok) {
+            setEmployeeSnapshot((await employeesResponse.json()) as ApiEmployeeSnapshot);
+          }
+        } catch {
+          // Ignore bridge failures and keep the local sim running.
+        }
+      })();
     }
   }
 
@@ -1249,7 +1351,17 @@ export default function App() {
     setLocalRunState('paused');
 
     if (apiConnected) {
-      void fetch('/api/stop', { method: 'POST' }).catch(() => undefined);
+      void (async () => {
+        try {
+          await fetch('/api/stop', { method: 'POST' });
+          const employeesResponse = await fetch('/api/employees');
+          if (employeesResponse.ok) {
+            setEmployeeSnapshot((await employeesResponse.json()) as ApiEmployeeSnapshot);
+          }
+        } catch {
+          // Ignore bridge failures and keep the local pause state.
+        }
+      })();
     }
   }
 
@@ -1496,9 +1608,11 @@ export default function App() {
       name: 'Sam',
       strip: actorProfiles.sam.strip,
       position: employeeById(employeeSnapshot, 'sam')?.position ?? actorProfiles.sam.thought.title,
-      status: actorStatusText(world.actors.sam, locations),
+      status: employeeById(employeeSnapshot, 'sam')?.status ?? actorStatusText(world.actors.sam, locations),
       bio: employeeById(employeeSnapshot, 'sam')?.bio ?? 'Steady and patient, Sam keeps the front-end work calm and organized.',
-      location: locationById(world.actors.sam.currentLocationId ?? actorProfiles.sam.startLocationId, locations)?.label ?? 'Unknown',
+      location:
+        locationById(employeeById(employeeSnapshot, 'sam')?.currentLocationId ?? world.actors.sam.currentLocationId ?? actorProfiles.sam.startLocationId, locations)?.label ??
+        'Unknown',
       checklist: employeeById(employeeSnapshot, 'sam')?.checklist ?? actorProfiles.sam.thought.checklist,
     },
     {
@@ -1506,9 +1620,11 @@ export default function App() {
       name: 'Jeremy',
       strip: actorProfiles.jeremy.strip,
       position: employeeById(employeeSnapshot, 'jeremy')?.position ?? actorProfiles.jeremy.thought.title,
-      status: actorStatusText(world.actors.jeremy, locations),
+      status: employeeById(employeeSnapshot, 'jeremy')?.status ?? actorStatusText(world.actors.jeremy, locations),
       bio: employeeById(employeeSnapshot, 'jeremy')?.bio ?? 'Direct and reliable, Jeremy likes quick fixes that remove blockers fast.',
-      location: locationById(world.actors.jeremy.currentLocationId ?? actorProfiles.jeremy.startLocationId, locations)?.label ?? 'Unknown',
+      location:
+        locationById(employeeById(employeeSnapshot, 'jeremy')?.currentLocationId ?? world.actors.jeremy.currentLocationId ?? actorProfiles.jeremy.startLocationId, locations)?.label ??
+        'Unknown',
       checklist: employeeById(employeeSnapshot, 'jeremy')?.checklist ?? actorProfiles.jeremy.thought.checklist,
     },
     ...fixedStaffProfiles.map((staff) => {
@@ -1519,9 +1635,9 @@ export default function App() {
         name: backendEmployee?.name ?? staff.name,
         strip: staff.strip,
         position: backendEmployee?.position ?? staff.position,
-        status: staffStatusText(mover, staff, locations),
+        status: backendEmployee?.status ?? staffStatusText(mover, staff, locations),
         bio: backendEmployee?.bio ?? staff.bio,
-        location: locationById(mover?.currentLocationId ?? staff.locationId, locations)?.label ?? staff.position,
+        location: locationById(backendEmployee?.currentLocationId ?? mover?.currentLocationId ?? staff.locationId, locations)?.label ?? staff.position,
         checklist:
           backendEmployee?.checklist ?? [
             staffStatusText(mover, staff, locations),

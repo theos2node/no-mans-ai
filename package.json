@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "Office simulation prototype",
   "private": true,
+  "type": "module",
   "scripts": {
     "api": "node src/api/server.ts",
     "dev": "vite",
