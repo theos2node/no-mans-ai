@@ -2540,7 +2540,7 @@ export default function App() {
                   <span>Inbound: {entry.inboundRequests.length}</span>
                   <span>Outbound: {entry.outboundRequests.length}</span>
                   <span>Passive memory: {entry.passiveMemoryCount}</span>
-                  <span>Desk notes: {entry.privateNoteCount ?? 0}</span>
+                  <span>Memory notes: {entry.privateNoteCount ?? 0}</span>
                 </div>
                 {entry.currentEmailSubject ? <p className="dossier-current-action">Email: {entry.currentEmailSubject}</p> : null}
                 <ul className="dossier-list">
