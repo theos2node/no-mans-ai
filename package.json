@@ -10,7 +10,8 @@
     "build": "vite build",
     "build:sprites": "node scripts/build-sprites.mjs",
     "check": "tsc --noEmit",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "proxy": "./scripts/run-local-openai-proxy.sh"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
