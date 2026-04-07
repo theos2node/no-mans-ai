@@ -4,7 +4,6 @@ import http, { type IncomingMessage, type ServerResponse } from 'http';
 
 import {
   createLivePlannerConfig,
-  createRunnerMeta,
   OfficeSimulationEngine,
   type DashboardEvent,
   type EmployeeSyncPayload,
@@ -12,7 +11,6 @@ import {
 
 const PORT = Number(process.env.PORT ?? 8787);
 const planner = createLivePlannerConfig();
-const META = createRunnerMeta(planner);
 
 function sendJson(response: ServerResponse, statusCode: number, payload: unknown): void {
   response.writeHead(statusCode, {
@@ -59,7 +57,7 @@ const server = http.createServer(async (request: IncomingMessage, response: Serv
   }
 
   if (request.method === 'GET' && url === '/api/meta') {
-    sendJson(response, 200, META);
+    sendJson(response, 200, runtime.getRunnerMeta());
     return;
   }
 

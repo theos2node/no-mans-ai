@@ -94,6 +94,11 @@ button {
   cursor: pointer;
 }
 
+.nav-button.is-active {
+  background: rgba(182, 63, 63, 0.92);
+  border-color: rgba(255, 200, 200, 0.3);
+}
+
 .icon-button {
   min-width: 44px;
   padding-inline: 0;
@@ -226,6 +231,45 @@ button {
   color: rgba(244, 239, 219, 0.78);
 }
 
+.settings-readout,
+.settings-form {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(18, 24, 34, 0.82);
+}
+
+.settings-readout-title {
+  margin: 0;
+  font-family: 'Press Start 2P', monospace;
+  font-size: 0.46rem;
+  color: rgba(244, 239, 219, 0.72);
+}
+
+.settings-readout p {
+  margin: 0;
+}
+
+.settings-field {
+  display: grid;
+  gap: 6px;
+  font-size: 1rem;
+}
+
+.settings-field span {
+  color: rgba(244, 239, 219, 0.72);
+}
+
+.settings-field input {
+  min-height: 38px;
+  padding: 8px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(11, 15, 22, 0.92);
+  color: var(--text);
+  font: inherit;
+}
+
 .settings-metrics {
   display: flex;
   flex-wrap: wrap;
@@ -282,6 +326,15 @@ button {
   background: #05070a;
 }
 
+.office-frame {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: min(100vw, calc(100vh * 3464 / 1184));
+  height: min(100vh, calc(100vw * 1184 / 3464));
+  transform: translate(-50%, -50%);
+}
+
 .office-stage.is-hidden {
   display: none;
 }
@@ -301,7 +354,7 @@ button {
   inset: 0;
   width: 100%;
   height: 100%;
-  object-fit: contain;
+  object-fit: fill;
   image-rendering: pixelated;
   user-select: none;
 }
@@ -314,6 +367,8 @@ button {
 
 .grid-overlay {
   z-index: 3;
+  touch-action: none;
+  user-select: none;
 }
 
 .location-reveal-layer {
@@ -327,6 +382,7 @@ button {
   background: rgba(12, 14, 18, 0.12);
   padding: 0;
   cursor: crosshair;
+  touch-action: none;
 }
 
 .grid-cell.is-walkable {
@@ -352,6 +408,16 @@ button {
   box-shadow: inset 0 0 0 1px rgba(115, 217, 255, 0.74);
 }
 
+.grid-cell.is-entrance {
+  border-color: rgba(121, 240, 168, 0.95);
+  box-shadow: inset 0 0 0 1px rgba(121, 240, 168, 0.84);
+}
+
+.grid-cell.is-exit {
+  border-color: rgba(255, 160, 118, 0.95);
+  box-shadow: inset 0 0 0 1px rgba(255, 160, 118, 0.84);
+}
+
 .location-reveal-chip {
   position: absolute;
   transform: translate(-50%, -100%);
@@ -367,6 +433,20 @@ button {
 .location-reveal-chip.is-active {
   background: rgba(182, 63, 63, 0.96);
   border-color: rgba(255, 200, 200, 0.3);
+}
+
+.location-reveal-chip.is-door {
+  z-index: 2;
+}
+
+.location-reveal-chip.is-entrance {
+  background: rgba(17, 73, 44, 0.96);
+  border-color: rgba(121, 240, 168, 0.5);
+}
+
+.location-reveal-chip.is-exit {
+  background: rgba(110, 51, 25, 0.96);
+  border-color: rgba(255, 160, 118, 0.5);
 }
 
 .office-actor {
@@ -569,6 +649,46 @@ button {
   padding-bottom: 24px;
 }
 
+.dashboard-panels {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px;
+}
+
+.dashboard-sidecard {
+  display: grid;
+  gap: 10px;
+  padding: 16px;
+  border: 1px solid var(--panel-border);
+  background: rgba(11, 15, 22, 0.78);
+}
+
+.sidecard-label {
+  margin: 0;
+  color: rgba(244, 239, 219, 0.62);
+  font-family: 'Press Start 2P', monospace;
+  font-size: 0.42rem;
+}
+
+.sidecard-value {
+  font-family: 'Press Start 2P', monospace;
+  font-size: 0.56rem;
+  line-height: 1.4;
+}
+
+.sidecard-list {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 6px;
+}
+
+.sidecard-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
 .dossier-card {
   padding: 16px 18px;
   border: 1px solid var(--panel-border);
@@ -612,12 +732,23 @@ button {
 
 .dossier-position,
 .dossier-location,
+.dossier-objective,
+.dossier-current-action,
+.dossier-performance,
 .dossier-bio {
   margin: 0 0 8px;
 }
 
 .dossier-position {
   color: rgba(238, 179, 179, 0.92);
+}
+
+.dossier-objective {
+  color: rgba(244, 239, 219, 0.8);
+}
+
+.dossier-current-action {
+  color: #f7c9b3;
 }
 
 .dossier-status {
@@ -634,6 +765,56 @@ button {
   padding-left: 18px;
   display: grid;
   gap: 6px;
+}
+
+.dossier-meta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 10px;
+  color: rgba(244, 239, 219, 0.7);
+  font-family: 'Press Start 2P', monospace;
+  font-size: 0.38rem;
+}
+
+.dossier-request-groups,
+.memory-group {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.request-group {
+  display: grid;
+  gap: 8px;
+}
+
+.request-group-label {
+  margin: 0;
+  color: rgba(244, 239, 219, 0.62);
+  font-family: 'Press Start 2P', monospace;
+  font-size: 0.42rem;
+}
+
+.request-list,
+.memory-list {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 6px;
+}
+
+.request-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.dossier-performance {
+  color: rgba(244, 239, 219, 0.68);
+  font-family: 'Press Start 2P', monospace;
+  font-size: 0.38rem;
+  line-height: 1.7;
 }
 
 @media (max-width: 900px) {

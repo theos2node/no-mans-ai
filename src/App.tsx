@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react';
 
 import avaReactAWalkStrip from './assets/ava-react-a-walk.png';
 import ellisAccountingWalkStrip from './assets/ellis-accounting-walk.png';
@@ -10,16 +10,19 @@ import officeMap from './assets/office-map-v2.png';
 import petraQualityWalkStrip from './assets/petra-quality-walk.png';
 import rowanManagerWalkStrip from './assets/rowan-manager-walk.png';
 import samWalkStrip from './assets/sam-walk.png';
-import defaultGridSelection from './default-grid-selection.json';
+import defaultLayoutJson from './default-layout.json';
 import {
   MAP_HEIGHT,
   MAP_WIDTH,
   TILE_TICKS,
+  buildGridColumns,
   buildNavigationGrid,
   cellCenter,
   closestWalkableIndex,
+  createEmptyNavigationGrid,
   directionBetween,
   findPath,
+  gridIndexForPoint,
   locationById,
   normalizeOfficeLocations,
   officeLocations,
@@ -31,7 +34,6 @@ import {
 
 type ThoughtPlacement = 'left' | 'center' | 'right';
 type AppView = 'office' | 'dashboard';
-type SettingsSection = 'grid' | 'locations';
 type LocalRunState = 'running' | 'paused';
 
 interface TaskThought {
@@ -66,9 +68,12 @@ interface RouteState {
   direction: Direction;
   frameIndex: number;
   destinationId: string | null;
+  targetCell: number | null;
   currentLocationId: string | null;
   path: number[];
   scriptQueue: string[];
+  testCellQueue: number[];
+  waitTicksRemaining: number;
   backendPlanVersion: number;
 }
 
@@ -110,29 +115,127 @@ interface ApiUsageSnapshot {
   outputTokens: number;
   totalTokens: number;
   estimatedCostUsd: number;
+  byModel?: Array<{
+    model: string;
+    requestCount: number;
+    totalTokens: number;
+    estimatedCostUsd: number;
+  }>;
+}
+
+interface ApiMemoryItem {
+  id: string;
+  summary: string;
+  kind: string;
+}
+
+interface ApiRequestSummary {
+  id: string;
+  kind: string;
+  status: string;
+  title: string;
+  counterpartId: string;
+  counterpartName: string;
+  updatedAt: string;
+}
+
+interface ApiPerformanceStats {
+  completedPlans: number;
+  reviewRejections: number;
+  approvalsGiven: number;
+  approvalsReceived: number;
+  escalations: number;
+  investigations: number;
+  corrections: number;
+  qualityScore: number;
+}
+
+interface ApiOfficeRequest {
+  id: string;
+  kind: string;
+  title: string;
+  details: string;
+  fromId: string;
+  toId: string;
+  locationId: string;
+  status: string;
+  updatedAt: string;
+}
+
+interface ApiTerminalItem {
+  id: string;
+  title: string;
+  summary: string;
+  fromId: string;
+  priority: string;
+  status: string;
+  locationId: string;
+}
+
+interface ApiPlaybookRule {
+  id: string;
+  title: string;
+  summary: string;
+}
+
+interface ApiKnowledgeNote {
+  id: string;
+  title: string;
+  summary: string;
 }
 
 interface ApiEmployeeState {
   id: string;
   name: string;
   position: string;
+  department?: string;
   assignedLocationId: string;
+  supervisorId?: string | null;
+  preferredModel?: string | null;
   currentLocationId: string;
   targetLocationId: string | null;
   phase: string;
   bio: string;
   status: string;
   taskTitle: string;
+  objective?: string;
   checklist: string[];
   scriptQueue: string[];
   planVersion: number;
   lastUpdatedAt: string;
+  currentAction?: string | null;
+  currentActionType?: string | null;
+  currentEmailSubject?: string | null;
+  privateNoteCount?: number;
+  activeMemory?: ApiMemoryItem[];
+  passiveMemoryCount?: number;
+  inboundRequests?: ApiRequestSummary[];
+  outboundRequests?: ApiRequestSummary[];
+  performance?: ApiPerformanceStats;
 }
 
 interface ApiEmployeeSnapshot {
   mode: 'live' | 'local';
   employees: ApiEmployeeState[];
   usage: ApiUsageSnapshot;
+  requests?: ApiOfficeRequest[];
+  terminal?: {
+    items: ApiTerminalItem[];
+    openCount: number;
+  };
+  playbook?: ApiPlaybookRule[];
+  knowledgeBase?: ApiKnowledgeNote[];
+  emailSimulator?: {
+    inboxCount: number;
+    sentCount: number;
+    pendingSubjects: string[];
+  };
+  summary?: {
+    pendingRequests: number;
+    openTerminal: number;
+    employeesWorking: number;
+    employeesWaiting: number;
+  };
 }
 
 interface EmployeeSyncEntry {
@@ -149,19 +252,6 @@ interface GridCell {
   style: CSSProperties;
 }
 
-interface GridSelectionPayload {
-  version: number;
-  mapWidth: number;
-  mapHeight: number;
-  cellSize: number;
-  selectedCells: Array<{
-    index: number;
-    col: number;
-    row: number;
-    walkable: boolean;
-  }>;
-}
-
 interface PanelPosition {
   x: number;
   y: number;
@@ -172,13 +262,27 @@ interface PanelDragState {
   offsetY: number;
 }
 
-const TICK_MS = 80;
+interface LayoutPayload {
+  version: number;
+  mapWidth: number;
+  mapHeight: number;
+  cellSize: number;
+  walkableIndices: number[];
+  locations: OfficeLocation[];
+  entranceIndex: number | null;
+  exitIndex: number | null;
+}
+
+type ConsoleSection = 'walkways' | 'locations' | 'doors';
+type ConsoleTool = 'add-walkway' | 'remove-walkway' | 'place-location' | 'place-entrance' | 'place-exit' | null;
+
+const TICK_MS = 45;
 const SPRITE_SIZE = 96;
 const TEST_SCRIPT_LENGTH = 8;
-const PATH_STORAGE_KEY = 'office-path-grid-v4';
-const LOCATION_STORAGE_KEY = 'office-location-grid-v3';
-const GRID_SELECTION_STORAGE_KEY = 'office-grid-selection-v1';
+const TEST_WAIT_TICKS = Math.max(1, Math.round(900 / TICK_MS));
+const TEST_ENTRANCE_STAGGER_TICKS = 5;
 const DEFAULT_SETTINGS_PANEL_POSITION: PanelPosition = { x: 20, y: 76 };
+const LAYOUT_STORAGE_KEY = 'no-mans-ai-layout-v3';
 
 const actorIds: ActorId[] = ['sam', 'jeremy'];
 const DEPRECATED_LOCATION_IDS = new Set(['sam-desk', 'jeremy-desk', 'manager-office', 'terminal-liaison']);
@@ -204,81 +308,30 @@ const actorProfiles: Record<ActorId, ActorProfile> = {
   },
 };
 
-const fixedStaffProfiles: StaffProfile[] = [
-  {
-    id: 'ava-react-a',
-    name: 'Ava Kim',
-    position: 'React A',
-    locationId: 'react-a',
-    strip: avaReactAWalkStrip,
-    bio: 'A quiet prototyper who likes clean interactions and stable systems.',
-    direction: 'right',
-    animationOffset: 1,
-  },
-  {
-    id: 'milo-react-b',
-    name: 'Milo Perez',
-    position: 'React B',
-    locationId: 'react-b',
-    strip: miloReactBWalkStrip,
-    bio: 'Fast-moving and energetic, usually the first one to volunteer for UI polish.',
-    direction: 'left',
-    animationOffset: 4,
-  },
-  {
-    id: 'nia-customer-service',
-    name: 'Nia Solis',
-    position: 'Customer Service',
-    locationId: 'customer-service',
-    strip: niaServiceWalkStrip,
-    bio: 'Warm, observant, and hard to rattle, with a strong memory for people.',
-    direction: 'left',
-    animationOffset: 13,
-  },
-  {
-    id: 'ellis-accounting',
-    name: 'Ellis Hart',
-    position: 'Accounting',
-    locationId: 'accounting',
-    strip: ellisAccountingWalkStrip,
-    bio: 'Methodical and dry-humored, Ellis notices bad numbers immediately.',
-    direction: 'down',
-    animationOffset: 16,
-  },
-  {
-    id: 'rowan-manager',
-    name: 'Rowan Pike',
-    position: 'General Manager',
-    locationId: 'general-manager',
-    strip: rowanManagerWalkStrip,
-    bio: 'Decisive and composed, Rowan keeps the office moving without over-talking.',
-    direction: 'down',
-    animationOffset: 19,
-  },
-  {
-    id: 'petra-quality',
-    name: 'Petra Vale',
-    position: 'Quality Inspector',
-    locationId: 'quality-inspector',
-    strip: petraQualityWalkStrip,
-    bio: 'Exacting and sharp-eyed, Petra spots tiny breakages before anyone else.',
-    direction: 'right',
-    animationOffset: 22,
-  },
-  {
-    id: 'june-terminal',
-    name: 'June Mercer',
-    position: 'IT Support',
-    locationId: 'it-support',
-    strip: juneLiaisonWalkStrip,
-    bio: 'Quick on diagnostics and calm under pressure, June handles office support without drama.',
-    direction: 'left',
-    animationOffset: 25,
-  },
-];
+const fixedStaffProfiles: StaffProfile[] = [];
+
+const entranceLaunchOrder = ['sam', 'jeremy', ...fixedStaffProfiles.map((profile) => profile.id)] as const;
+const unavailableRoster = ['Ava Kim', 'Milo Perez', 'Nia Solis', 'Ellis Hart', 'Rowan Pike', 'Petra Vale', 'June Mercer'];
 
 function employeeById(snapshot: ApiEmployeeSnapshot | null, id: string) {
   return snapshot?.employees.find((employee) => employee.id === id) ?? null;
+}
+
+function requestStatusLabel(status: string) {
+  switch (status) {
+    case 'pending':
+      return 'Pending';
+    case 'approved':
+      return 'Approved';
+    case 'rejected':
+      return 'Rejected';
+    case 'fulfilled':
+      return 'Fulfilled';
+    case 'escalated':
+      return 'Escalated';
+    default:
+      return status;
+  }
 }
 
 const directionFrames: Record<Direction, [number, number, number]> = {
@@ -297,6 +350,62 @@ function cloneLocations(locations: OfficeLocation[]) {
       jeremy: { ...location.targets.jeremy },
     },
   }));
+}
+
+function entranceLaunchDelayTicks(id: string) {
+  const index = entranceLaunchOrder.indexOf(id as (typeof entranceLaunchOrder)[number]);
+  return index < 0 ? 0 : index * TEST_ENTRANCE_STAGGER_TICKS;
+}
+
+function crowdOffset(index: number, total: number) {
+  if (total <= 1) {
+    return { x: 0, y: 0 };
+  }
+
+  if (total === 2) {
+    return [
+      { x: -18, y: 0 },
+      { x: 18, y: 0 },
+    ][index] ?? { x: 0, y: 0 };
+  }
+
+  if (total === 3) {
+    return [
+      { x: 0, y: -14 },
+      { x: -20, y: 12 },
+      { x: 20, y: 12 },
+    ][index] ?? { x: 0, y: 0 };
+  }
+
+  if (total === 4) {
+    return [
+      { x: -18, y: -8 },
+      { x: 18, y: -8 },
+      { x: -18, y: 16 },
+      { x: 18, y: 16 },
+    ][index] ?? { x: 0, y: 0 };
+  }
+
+  if (total === 5) {
+    return [
+      { x: 0, y: -16 },
+      { x: -22, y: -2 },
+      { x: 22, y: -2 },
+      { x: -14, y: 18 },
+      { x: 14, y: 18 },
+    ][index] ?? { x: 0, y: 0 };
+  }
+
+  const columns = Math.min(3, total);
+  const row = Math.floor(index / columns);
+  const col = index % columns;
+  const spreadX = 22;
+  const spreadY = 18;
+
+  return {
+    x: (col - (columns - 1) / 2) * spreadX,
+    y: row * spreadY - (row === 0 ? 12 : 0),
+  };
 }
 
 function idleFrame(direction: Direction) {
@@ -381,104 +490,244 @@ function buildGridCells(grid: NavigationGrid): GridCell[] {
 }
 
 function exactCellIndexForPoint(grid: NavigationGrid, point: { x: number; y: number }) {
-  const col = Math.max(0, Math.min(grid.cols - 1, Math.floor(point.x / grid.cellSize)));
-  const row = Math.max(0, Math.min(grid.rows - 1, Math.floor(point.y / grid.cellSize)));
-  return row * grid.cols + col;
+  return gridIndexForPoint(grid, point);
 }
 
-function loadNavigationGrid() {
-  const baseGrid = buildNavigationGrid();
+function serializeWalkableIndices(grid: NavigationGrid) {
+  const indices: number[] = [];
 
-  if (typeof window === 'undefined') {
-    return baseGrid;
-  }
-
-  const saved = window.localStorage.getItem(PATH_STORAGE_KEY);
-  if (!saved) {
-    return baseGrid;
-  }
-
-  try {
-    const indices = JSON.parse(saved) as number[];
-    const walkable = new Uint8Array(baseGrid.walkable.length);
-
-    for (const index of indices) {
-      if (typeof index === 'number' && index >= 0 && index < walkable.length) {
-        walkable[index] = 1;
-      }
+  for (let index = 0; index < grid.walkable.length; index += 1) {
+    if (grid.walkable[index] === 1) {
+      indices.push(index);
     }
+  }
+
+  return indices;
+}
+
+function buildNavigationFromSelectedIndices(selectedIndices: number[]) {
+  const baseGrid = createEmptyNavigationGrid();
+  const walkable = new Uint8Array(baseGrid.walkable.length);
+
+  for (const index of selectedIndices) {
+    if (index >= 0 && index < walkable.length) {
+      walkable[index] = 1;
+    }
+  }
+
+  return {
+    ...baseGrid,
+    walkable,
+  };
+}
+
+function defaultDoorIndices(grid: NavigationGrid) {
+  return {
+    entranceIndex: closestWalkableIndex(grid, { x: 0, y: MAP_HEIGHT * 0.72 }),
+    exitIndex: closestWalkableIndex(grid, { x: MAP_WIDTH - 1, y: MAP_HEIGHT * 0.72 }),
+  };
+}
+
+function slugifyLocationId(value: string) {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+function isPoint(value: unknown): value is { x: number; y: number } {
+  return Boolean(
+    value &&
+      typeof value === 'object' &&
+      Number.isFinite((value as { x?: unknown }).x) &&
+      Number.isFinite((value as { y?: unknown }).y),
+  );
+}
+
+function isOfficeLocationArray(value: unknown): value is OfficeLocation[] {
+  return (
+    Array.isArray(value) &&
+    value.every((location) => {
+      if (!location || typeof location !== 'object') {
+        return false;
+      }
+
+      const candidate = location as Partial<OfficeLocation>;
+      return (
+        typeof candidate.id === 'string' &&
+        typeof candidate.label === 'string' &&
+        isPoint(candidate.marker) &&
+        Boolean(candidate.targets) &&
+        isPoint(candidate.targets?.sam) &&
+        isPoint(candidate.targets?.jeremy)
+      );
+    })
+  );
+}
+
+function normalizeDoorIndex(
+  grid: NavigationGrid,
+  candidateIndex: number | null | undefined,
+  fallbackPoint: { x: number; y: number },
+) {
+  if (
+    typeof candidateIndex === 'number' &&
+    Number.isInteger(candidateIndex) &&
+    candidateIndex >= 0 &&
+    candidateIndex < grid.walkable.length &&
+    grid.walkable[candidateIndex] === 1
+  ) {
+    return candidateIndex;
+  }
+
+  return closestWalkableIndex(grid, fallbackPoint);
+}
+
+function collectReachableCells(grid: NavigationGrid, startCell: number) {
+  const reachable = new Set<number>();
+
+  if (startCell < 0 || startCell >= grid.walkable.length || grid.walkable[startCell] !== 1) {
+    return reachable;
+  }
+
+  const queue = [startCell];
+  reachable.add(startCell);
+
+  while (queue.length > 0) {
+    const cell = queue.shift();
+    if (cell === undefined) {
+      continue;
+    }
+
+    const col = cell % grid.cols;
+    const row = Math.floor(cell / grid.cols);
+    const neighbors = [
+      { col: col + 1, row },
+      { col: col - 1, row },
+      { col, row: row + 1 },
+      { col, row: row - 1 },
+    ];
+
+    for (const neighbor of neighbors) {
+      if (neighbor.col < 0 || neighbor.col >= grid.cols || neighbor.row < 0 || neighbor.row >= grid.rows) {
+        continue;
+      }
+
+      const neighborIndex = neighbor.row * grid.cols + neighbor.col;
+      if (grid.walkable[neighborIndex] !== 1 || reachable.has(neighborIndex)) {
+        continue;
+      }
+
+      reachable.add(neighborIndex);
+      queue.push(neighborIndex);
+    }
+  }
+
+  return reachable;
+}
+
+function closestReachableIndex(grid: NavigationGrid, point: { x: number; y: number }, reachable: Set<number>) {
+  let bestIndex: number | null = null;
+  let bestDistance = Number.POSITIVE_INFINITY;
+
+  for (const index of reachable) {
+    const center = cellCenter(grid, index);
+    const dx = center.x - point.x;
+    const dy = center.y - point.y;
+    const distance = dx * dx + dy * dy;
+
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestIndex = index;
+    }
+  }
+
+  return bestIndex;
+}
+
+function normalizeReachableLocations(grid: NavigationGrid, locations: OfficeLocation[], originCell: number | null) {
+  if (originCell === null) {
+    return cloneLocations(locations);
+  }
+
+  const reachable = collectReachableCells(grid, originCell);
+  if (reachable.size === 0) {
+    return cloneLocations(locations);
+  }
+
+  return locations.map((location) => {
+    const markerIndex = closestReachableIndex(grid, location.marker, reachable);
+    const samIndex = closestReachableIndex(grid, location.targets.sam, reachable);
+    const jeremyIndex = closestReachableIndex(grid, location.targets.jeremy, reachable);
 
     return {
-      ...baseGrid,
-      walkable,
+      ...location,
+      marker: markerIndex === null ? location.marker : cellCenter(grid, markerIndex),
+      targets: {
+        sam: samIndex === null ? location.targets.sam : cellCenter(grid, samIndex),
+        jeremy: jeremyIndex === null ? location.targets.jeremy : cellCenter(grid, jeremyIndex),
+      },
     };
-  } catch {
-    return baseGrid;
-  }
+  });
 }
 
-function loadLocations() {
-  const grid = buildNavigationGrid();
-  const defaults = cloneLocations(normalizeOfficeLocations(grid, officeLocations));
+function coerceLayoutPayload(payload: Partial<LayoutPayload> | null | undefined, fallbackLocations = officeLocations) {
+  const fallbackNavigation = buildNavigationGrid();
+  const fallbackDoors = defaultDoorIndices(fallbackNavigation);
 
-  if (typeof window === 'undefined') {
-    return defaults;
+  if (
+    !payload ||
+    payload.version !== 2 ||
+    payload.mapWidth !== MAP_WIDTH ||
+    payload.mapHeight !== MAP_HEIGHT ||
+    payload.cellSize !== fallbackNavigation.cellSize ||
+    !Array.isArray(payload.walkableIndices) ||
+    !isOfficeLocationArray(payload.locations)
+  ) {
+    const normalizedLocations = cloneLocations(normalizeOfficeLocations(fallbackNavigation, fallbackLocations));
+    const locations = normalizeReachableLocations(fallbackNavigation, normalizedLocations, fallbackDoors.entranceIndex);
+    return {
+      navigation: fallbackNavigation,
+      locations,
+      entranceIndex: fallbackDoors.entranceIndex,
+      exitIndex: fallbackDoors.exitIndex,
+    };
   }
 
-  const saved = window.localStorage.getItem(LOCATION_STORAGE_KEY);
-  if (!saved) {
-    return defaults;
+  const navigation = buildNavigationFromSelectedIndices(payload.walkableIndices.filter((index) => Number.isInteger(index)));
+  const normalizedLocations = cloneLocations(normalizeOfficeLocations(navigation, payload.locations));
+  const entranceIndex = normalizeDoorIndex(navigation, payload.entranceIndex, { x: 0, y: MAP_HEIGHT * 0.72 });
+  const exitIndex = normalizeDoorIndex(navigation, payload.exitIndex, { x: MAP_WIDTH - 1, y: MAP_HEIGHT * 0.72 });
+  const locations = normalizeReachableLocations(navigation, normalizedLocations, entranceIndex);
+
+  return {
+    navigation,
+    locations,
+    entranceIndex,
+    exitIndex,
+  };
+}
+
+function createDefaultLayout() {
+  return coerceLayoutPayload(defaultLayoutJson as Partial<LayoutPayload>);
+}
+
+function loadStoredLayout() {
+  const fallback = createDefaultLayout();
+
+  if (typeof window === 'undefined') {
+    return fallback;
   }
 
   try {
-    const parsed = JSON.parse(saved) as OfficeLocation[];
-    if (!Array.isArray(parsed) || parsed.length === 0) {
-      return defaults;
+    const raw = window.localStorage.getItem(LAYOUT_STORAGE_KEY);
+    if (!raw) {
+      return fallback;
     }
 
-    const sanitized = parsed
-      .filter(
-        (location) =>
-          location &&
-          typeof location.id === 'string' &&
-          typeof location.label === 'string' &&
-          !DEPRECATED_LOCATION_IDS.has(location.id),
-      )
-      .map((location) => ({
-        id: location.id,
-        label: location.label,
-        marker: { x: location.marker.x, y: location.marker.y },
-        targets: {
-          sam: { x: location.targets.sam.x, y: location.targets.sam.y },
-          jeremy: { x: location.targets.jeremy.x, y: location.targets.jeremy.y },
-        },
-      }));
-
-    const savedById = new Map(sanitized.map((location) => [location.id, location] as const));
-    const mergedDefaults = defaults.map((location) => savedById.get(location.id) ?? location);
-    const extraSaved = sanitized.filter((location) => !defaults.some((defaultLocation) => defaultLocation.id === location.id));
-
-    return normalizeOfficeLocations(grid, [...mergedDefaults, ...extraSaved]);
-  } catch {
-    return defaults;
-  }
-}
-
-function loadGridSelectionIndices() {
-  const fallback = (defaultGridSelection as GridSelectionPayload).selectedCells.map((cell) => cell.index);
-
-  if (typeof window === 'undefined') {
-    return fallback;
-  }
-
-  const saved = window.localStorage.getItem(GRID_SELECTION_STORAGE_KEY);
-  if (!saved) {
-    return fallback;
-  }
-
-  try {
-    const parsed = JSON.parse(saved) as number[];
-    return Array.isArray(parsed) ? parsed.filter((index) => typeof index === 'number') : fallback;
+    const parsed = JSON.parse(raw) as Partial<LayoutPayload>;
+    return coerceLayoutPayload(parsed, fallback.locations);
   } catch {
     return fallback;
   }
@@ -497,23 +746,55 @@ function createRouteState(grid: NavigationGrid, point: { x: number; y: number },
     direction,
     frameIndex: idleFrame(direction),
     destinationId: null,
+    targetCell: null,
     currentLocationId,
     path: [],
     scriptQueue: [],
+    testCellQueue: [],
+    waitTicksRemaining: 0,
     backendPlanVersion: 0,
   };
 }
 
+function resetRouteToCell<T extends RouteState>(
+  route: T,
+  grid: NavigationGrid,
+  cell: number,
+  direction: Direction,
+  currentLocationId: string | null,
+  scriptQueue: string[] = [],
+  waitTicksRemaining = 0,
+) {
+  const center = cellCenter(grid, cell);
+  return {
+    ...route,
+    cell,
+    nextCell: null,
+    moveProgress: 0,
+    x: center.x,
+    y: center.y,
+    direction,
+    frameIndex: idleFrame(direction),
+    destinationId: null,
+    targetCell: null,
+    currentLocationId,
+    path: [],
+    scriptQueue,
+    testCellQueue: [],
+    waitTicksRemaining,
+  };
+}
+
 function createWorldState(grid: NavigationGrid, locations: OfficeLocation[]): WorldState {
-  const samLocation = locationById(actorProfiles.sam.startLocationId, locations) ?? locations[0];
-  const jeremyLocation = locationById(actorProfiles.jeremy.startLocationId, locations) ?? locations[0];
+  const samLocation = locationById(actorProfiles.sam.startLocationId, locations) ?? locations[0] ?? null;
+  const jeremyLocation = locationById(actorProfiles.jeremy.startLocationId, locations) ?? locations[0] ?? null;
 
   return {
     tick: 0,
     testing: false,
     actors: {
-      sam: createRouteState(grid, samLocation.targets.sam, 'right', samLocation.id),
-      jeremy: createRouteState(grid, jeremyLocation.targets.jeremy, 'left', jeremyLocation.id),
+      sam: createRouteState(grid, samLocation?.targets.sam ?? { x: 0, y: 0 }, 'right', samLocation?.id ?? ''),
+      jeremy: createRouteState(grid, jeremyLocation?.targets.jeremy ?? { x: 0, y: 0 }, 'left', jeremyLocation?.id ?? ''),
     },
   };
 }
@@ -521,8 +802,8 @@ function createWorldState(grid: NavigationGrid, locations: OfficeLocation[]): Wo
 function createStaffTestState(grid: NavigationGrid, locations: OfficeLocation[]): StaffTestState {
   const movers = Object.fromEntries(
     fixedStaffProfiles.map((profile) => {
-      const startLocation = locationById(profile.locationId, locations) ?? locations[0];
-      return [profile.id, createRouteState(grid, startLocation.marker, profile.direction, startLocation.id)] as const;
+      const startLocation = locationById(profile.locationId, locations) ?? locations[0] ?? null;
+      return [profile.id, createRouteState(grid, startLocation?.marker ?? { x: 0, y: 0 }, profile.direction, startLocation?.id ?? '')] as const;
     }),
   ) as Record<string, RouteState>;
 
@@ -551,9 +832,12 @@ function remapWorldToGrid(world: WorldState, grid: NavigationGrid, locations: Of
       x: center.x,
       y: center.y,
       destinationId,
+      targetCell: null,
       currentLocationId,
       path: [],
       scriptQueue: [],
+      testCellQueue: [],
+      waitTicksRemaining: 0,
       frameIndex: idleFrame(actor.direction),
       backendPlanVersion: actor.backendPlanVersion,
     };
@@ -584,9 +868,12 @@ function remapStaffTestToGrid(current: StaffTestState, grid: NavigationGrid, loc
           x: center.x,
           y: center.y,
           destinationId: null,
+          targetCell: null,
           currentLocationId: existing?.currentLocationId ?? profile.locationId,
           path: [],
           scriptQueue: [],
+          testCellQueue: [],
+          waitTicksRemaining: 0,
           frameIndex: idleFrame(existing?.direction ?? profile.direction),
           backendPlanVersion: existing?.backendPlanVersion ?? 0,
         },
@@ -605,8 +892,10 @@ function finishArrival<T extends RouteState>(route: T, destinationId: string): T
   return {
     ...route,
     destinationId: null,
+    targetCell: null,
     currentLocationId: destinationId,
     path: [],
+    waitTicksRemaining: TEST_WAIT_TICKS,
     frameIndex: idleFrame(route.direction),
   };
 }
@@ -614,6 +903,16 @@ function finishArrival<T extends RouteState>(route: T, destinationId: string): T
 function stepMovingRoute<T extends RouteState>(route: T, tick: number, grid: NavigationGrid): T {
   if (route.nextCell === null) {
     const center = cellCenter(grid, route.cell);
+    if (route.waitTicksRemaining > 0) {
+      return {
+        ...route,
+        x: center.x,
+        y: center.y,
+        waitTicksRemaining: route.waitTicksRemaining - 1,
+        frameIndex: idleFrame(route.direction),
+      };
+    }
+
     return {
       ...route,
       x: center.x,
@@ -654,7 +953,20 @@ function stepMovingRoute<T extends RouteState>(route: T, tick: number, grid: Nav
 }
 
 function primeQueuedDestination<T extends RouteState>(route: T): T {
-  if (route.nextCell !== null || route.destinationId !== null || route.scriptQueue.length === 0) {
+  if (route.nextCell !== null || route.destinationId !== null || route.targetCell !== null || route.waitTicksRemaining > 0) {
+    return route;
+  }
+
+  if (route.testCellQueue.length > 0) {
+    const [nextCell, ...remainingQueue] = route.testCellQueue;
+    return {
+      ...route,
+      targetCell: nextCell ?? null,
+      testCellQueue: remainingQueue,
+    };
+  }
+
+  if (route.scriptQueue.length === 0) {
     return route;
   }
 
@@ -673,24 +985,37 @@ function planRouteStep<T extends RouteState>(
   goalCell: number | null,
   blocked: Set<number>,
 ): T {
-  if (route.nextCell !== null || !route.destinationId) {
+  if (route.nextCell !== null || (route.destinationId === null && route.targetCell === null)) {
     return route;
   }
 
-  if (goalCell === null) {
+  const resolvedGoalCell = route.targetCell ?? goalCell;
+
+  if (resolvedGoalCell === null) {
     return {
       ...route,
       destinationId: null,
+      targetCell: null,
       path: [],
       frameIndex: idleFrame(route.direction),
     };
   }
 
-  if (route.cell === goalCell) {
-    return finishArrival(route, route.destinationId);
+  if (route.cell === resolvedGoalCell) {
+    if (route.destinationId) {
+      return finishArrival(route, route.destinationId);
+    }
+
+    return {
+      ...route,
+      targetCell: null,
+      path: [],
+      waitTicksRemaining: TEST_WAIT_TICKS,
+      frameIndex: idleFrame(route.direction),
+    };
   }
 
-  const path = findPath(grid, route.cell, goalCell, blocked);
+  const path = findPath(grid, route.cell, resolvedGoalCell, blocked);
   const nextCell = path[0];
   if (nextCell === undefined || blocked.has(nextCell)) {
     return {
@@ -757,30 +1082,60 @@ function buildRandomScripts(world: WorldState, locations: OfficeLocation[]) {
   return { samQueue, jeremyQueue };
 }
 
-function buildRandomQueue(currentLocationId: string | null, locations: OfficeLocation[], count = TEST_SCRIPT_LENGTH) {
-  const queue: string[] = [];
-  let lastLocationId = currentLocationId;
+function shuffleArray<T>(items: T[]) {
+  const shuffled = [...items];
+  for (let index = shuffled.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(Math.random() * (index + 1));
+    [shuffled[index], shuffled[swapIndex]] = [shuffled[swapIndex], shuffled[index]];
+  }
+  return shuffled;
+}
 
-  for (let index = 0; index < count; index += 1) {
-    const choices = locations.filter((location) => location.id !== lastLocationId);
-    const pool = choices.length > 0 ? choices : locations;
-    const choice = pool[Math.floor(Math.random() * pool.length)];
-    queue.push(choice.id);
-    lastLocationId = choice.id;
+function buildTestLocationQueue(currentLocationId: string | null, locations: OfficeLocation[]) {
+  const locationIds = locations
+    .map((location) => location.id)
+    .filter((locationId) => locationId !== currentLocationId);
+
+  return shuffleArray(locationIds);
+}
+
+function refillTestQueue<T extends RouteState>(route: T, locations: OfficeLocation[]) {
+  if (
+    route.nextCell !== null ||
+    route.destinationId !== null ||
+    route.targetCell !== null ||
+    route.waitTicksRemaining > 0 ||
+    route.scriptQueue.length > 0 ||
+    route.testCellQueue.length > 0
+  ) {
+    return route;
   }
 
-  return queue;
+  return {
+    ...route,
+    scriptQueue: buildTestLocationQueue(route.currentLocationId, locations),
+  };
 }
 
 function stepWorld(current: WorldState, grid: NavigationGrid, locations: OfficeLocation[]): WorldState {
   const actors: Record<ActorId, RouteState> = {
-    sam: stepMovingRoute({ ...current.actors.sam, path: [...current.actors.sam.path], scriptQueue: [...current.actors.sam.scriptQueue] }, current.tick, grid),
+    sam: stepMovingRoute(
+      { ...current.actors.sam, path: [...current.actors.sam.path], scriptQueue: [...current.actors.sam.scriptQueue], testCellQueue: [...current.actors.sam.testCellQueue] },
+      current.tick,
+      grid,
+    ),
     jeremy: stepMovingRoute(
-      { ...current.actors.jeremy, path: [...current.actors.jeremy.path], scriptQueue: [...current.actors.jeremy.scriptQueue] },
+      { ...current.actors.jeremy, path: [...current.actors.jeremy.path], scriptQueue: [...current.actors.jeremy.scriptQueue], testCellQueue: [...current.actors.jeremy.testCellQueue] },
       current.tick,
       grid,
     ),
   };
+
+  if (current.testing) {
+    for (const actorId of actorIds) {
+      actors[actorId] = refillTestQueue(actors[actorId], locations);
+    }
+  }
 
   for (const actorId of actorIds) {
     actors[actorId] = primeQueuedDestination(actors[actorId]);
@@ -799,25 +1154,27 @@ function stepWorld(current: WorldState, grid: NavigationGrid, locations: OfficeL
 
   for (const actorId of planningOrder) {
     const actor = actors[actorId];
-    if (actor.nextCell !== null || !actor.destinationId) {
+    if (actor.nextCell !== null || (actor.destinationId === null && actor.targetCell === null)) {
       continue;
     }
 
-    const goalCell = actorGoalCell(grid, actorId, actor.destinationId, locations);
+    const goalCell = actor.targetCell ?? (actor.destinationId ? actorGoalCell(grid, actorId, actor.destinationId, locations) : null);
     const blocked = new Set<number>();
-    for (const otherId of actorIds) {
-      if (otherId === actorId) {
-        continue;
+    if (actor.targetCell === null) {
+      for (const otherId of actorIds) {
+        if (otherId === actorId) {
+          continue;
+        }
+
+        blocked.add(actors[otherId].cell);
+        if (actors[otherId].nextCell !== null) {
+          blocked.add(actors[otherId].nextCell);
+        }
       }
 
-      blocked.add(actors[otherId].cell);
-      if (actors[otherId].nextCell !== null) {
-        blocked.add(actors[otherId].nextCell);
+      for (const reservedCell of reserved) {
+        blocked.add(reservedCell);
       }
-    }
-
-    for (const reservedCell of reserved) {
-      blocked.add(reservedCell);
     }
 
     if (goalCell !== null) {
@@ -832,16 +1189,9 @@ function stepWorld(current: WorldState, grid: NavigationGrid, locations: OfficeL
     }
   }
 
-  const testing =
-    current.testing &&
-    !actorIds.every((actorId) => {
-      const actor = actors[actorId];
-      return actor.nextCell === null && actor.destinationId === null && actor.scriptQueue.length === 0;
-    });
-
   return {
     tick: current.tick + 1,
-    testing,
+    testing: current.testing,
     actors,
   };
 }
@@ -850,11 +1200,17 @@ function stepStaffTest(current: StaffTestState, grid: NavigationGrid, locations:
   const movers = Object.fromEntries(
     Object.entries(current.movers).map(([id, mover]) => [
       id,
-      stepMovingRoute({ ...mover, path: [...mover.path], scriptQueue: [...mover.scriptQueue] }, current.tick, grid),
+      stepMovingRoute({ ...mover, path: [...mover.path], scriptQueue: [...mover.scriptQueue], testCellQueue: [...mover.testCellQueue] }, current.tick, grid),
     ]),
   ) as Record<string, RouteState>;
 
   const moverIds = Object.keys(movers);
+
+  if (current.testing) {
+    for (const moverId of moverIds) {
+      movers[moverId] = refillTestQueue(movers[moverId], locations);
+    }
+  }
 
   for (const moverId of moverIds) {
     movers[moverId] = primeQueuedDestination(movers[moverId]);
@@ -873,26 +1229,27 @@ function stepStaffTest(current: StaffTestState, grid: NavigationGrid, locations:
 
   for (const moverId of planningOrder) {
     const mover = movers[moverId];
-    if (mover.nextCell !== null || !mover.destinationId) {
+    if (mover.nextCell !== null || (mover.destinationId === null && mover.targetCell === null)) {
       continue;
     }
 
-    const goalCell = staffGoalCell(grid, mover.destinationId, locations);
+    const goalCell = mover.targetCell ?? (mover.destinationId ? staffGoalCell(grid, mover.destinationId, locations) : null);
     const blocked = new Set<number>();
+    if (mover.targetCell === null) {
+      for (const otherId of moverIds) {
+        if (otherId === moverId) {
+          continue;
+        }
 
-    for (const otherId of moverIds) {
-      if (otherId === moverId) {
-        continue;
+        blocked.add(movers[otherId].cell);
+        if (movers[otherId].nextCell !== null) {
+          blocked.add(movers[otherId].nextCell);
+        }
       }
 
-      blocked.add(movers[otherId].cell);
-      if (movers[otherId].nextCell !== null) {
-        blocked.add(movers[otherId].nextCell);
+      for (const reservedCell of reserved) {
+        blocked.add(reservedCell);
       }
-    }
-
-    for (const reservedCell of reserved) {
-      blocked.add(reservedCell);
     }
 
     if (goalCell !== null) {
@@ -907,21 +1264,22 @@ function stepStaffTest(current: StaffTestState, grid: NavigationGrid, locations:
     }
   }
 
-  const testing =
-    current.testing &&
-    !moverIds.every((moverId) => {
-      const mover = movers[moverId];
-      return mover.nextCell === null && mover.destinationId === null && mover.scriptQueue.length === 0;
-    });
-
   return {
     tick: current.tick + 1,
-    testing,
+    testing: current.testing,
     movers,
   };
 }
 
 function actorStatusText(actor: RouteState, locations: OfficeLocation[]) {
+  if (actor.targetCell !== null) {
+    return 'Running test route';
+  }
+
+  if (actor.waitTicksRemaining > 0) {
+    return 'Waiting on test route';
+  }
+
   if (actor.destinationId) {
     const destination = locationById(actor.destinationId, locations);
     return destination ? `Walking to ${destination.label}` : 'Walking';
@@ -940,6 +1298,14 @@ function actorStatusText(actor: RouteState, locations: OfficeLocation[]) {
 function staffStatusText(mover: RouteState | undefined, staff: StaffProfile, locations: OfficeLocation[]) {
   if (!mover) {
     return `Holding at ${locationById(staff.locationId, locations)?.label ?? staff.position}`;
+  }
+
+  if (mover.targetCell !== null) {
+    return 'Running test route';
+  }
+
+  if (mover.waitTicksRemaining > 0) {
+    return 'Waiting on test route';
   }
 
   if (mover.destinationId) {
@@ -993,7 +1359,14 @@ function reconcileRouteWithBackend(
     return route;
   }
 
-  if (route.nextCell !== null || route.destinationId !== null || route.scriptQueue.length > 0) {
+  if (
+    route.nextCell !== null ||
+    route.destinationId !== null ||
+    route.targetCell !== null ||
+    route.scriptQueue.length > 0 ||
+    route.testCellQueue.length > 0 ||
+    route.waitTicksRemaining > 0
+  ) {
     return route;
   }
 
@@ -1016,17 +1389,21 @@ function reconcileRouteWithBackend(
     x: center.x,
     y: center.y,
     destinationId: null,
+    targetCell: null,
     currentLocationId: employee.currentLocationId,
     path: [],
     scriptQueue: [...employee.scriptQueue],
+    testCellQueue: [],
+    waitTicksRemaining: 0,
     frameIndex: idleFrame(route.direction),
     backendPlanVersion: employee.planVersion,
   };
 }
 
 export default function App() {
+  const gridOverlayRef = useRef<HTMLDivElement | null>(null);
   const [view, setView] = useState<AppView>('office');
-  const [localRunState, setLocalRunState] = useState<LocalRunState>('running');
+  const [localRunState, setLocalRunState] = useState<LocalRunState>('paused');
   const [navigation, setNavigation] = useState<NavigationGrid | null>(null);
   const [locations, setLocations] = useState<OfficeLocation[]>([]);
   const [world, setWorld] = useState<WorldState | null>(null);
@@ -1035,39 +1412,37 @@ export default function App() {
   const [employeeSnapshot, setEmployeeSnapshot] = useState<ApiEmployeeSnapshot | null>(null);
   const [apiMeta, setApiMeta] = useState<ApiMeta | null>(null);
   const [apiConnected, setApiConnected] = useState(false);
-  const [apiLive, setApiLive] = useState(false);
   const [selectedStaffId, setSelectedStaffId] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [settingsSection, setSettingsSection] = useState<SettingsSection>('grid');
-  const [revealLocations, setRevealLocations] = useState(false);
-  const [selectedGridCells, setSelectedGridCells] = useState<number[]>([]);
+  const [consoleSection, setConsoleSection] = useState<ConsoleSection>('walkways');
+  const [consoleTool, setConsoleTool] = useState<ConsoleTool>(null);
+  const [selectedCellIndex, setSelectedCellIndex] = useState<number | null>(null);
   const [gridSelectionMode, setGridSelectionMode] = useState<'add' | 'remove' | null>(null);
-  const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'failed'>('idle');
-  const [gridJsonInput, setGridJsonInput] = useState('');
-  const [applyStatus, setApplyStatus] = useState<'idle' | 'applied' | 'failed'>('idle');
-  const [locationDraft, setLocationDraft] = useState<OfficeLocation[]>([]);
   const [selectedLocationId, setSelectedLocationId] = useState<string | null>(null);
-  const [locationApplyStatus, setLocationApplyStatus] = useState<'idle' | 'applied'>('idle');
+  const [newLocationLabel, setNewLocationLabel] = useState('');
+  const [newLocationId, setNewLocationId] = useState('');
+  const [entranceIndex, setEntranceIndex] = useState<number | null>(null);
+  const [exitIndex, setExitIndex] = useState<number | null>(null);
   const [settingsPanelPosition, setSettingsPanelPosition] = useState<PanelPosition>(DEFAULT_SETTINGS_PANEL_POSITION);
   const [panelDragState, setPanelDragState] = useState<PanelDragState | null>(null);
   const gridCells = useMemo(() => (navigation ? buildGridCells(navigation) : []), [navigation]);
-  const selectedGridCellSet = useMemo(() => new Set(selectedGridCells), [selectedGridCells]);
+  const gridColumns = useMemo(() => (navigation ? buildGridColumns(navigation) : []), [navigation]);
 
   useEffect(() => {
-    const grid = loadNavigationGrid();
-    const loadedLocations = loadLocations();
-    setNavigation(grid);
-    setLocations(loadedLocations);
-    setLocationDraft(cloneLocations(loadedLocations));
-    setSelectedLocationId(loadedLocations[0]?.id ?? null);
-    setWorld(createWorldState(grid, loadedLocations));
-    setStaffTest(createStaffTestState(grid, loadedLocations));
-    setSelectedGridCells(loadGridSelectionIndices());
+    const layout = loadStoredLayout();
+    setNavigation(layout.navigation);
+    setLocations(layout.locations);
+    setSelectedLocationId(layout.locations[0]?.id ?? null);
+    setEntranceIndex(layout.entranceIndex);
+    setExitIndex(layout.exitIndex);
+    setWorld(createWorldState(layout.navigation, layout.locations));
+    setStaffTest(createStaffTestState(layout.navigation, layout.locations));
   }, []);
 
   useEffect(() => {
-    if (!settingsOpen || settingsSection !== 'grid') {
+    if (!settingsOpen) {
       setGridSelectionMode(null);
+      setConsoleTool(null);
       return;
     }
 
@@ -1079,12 +1454,19 @@ export default function App() {
     return () => {
       window.removeEventListener('pointerup', stopSelection);
     };
-  }, [settingsOpen, settingsSection]);
+  }, [settingsOpen]);
 
   useEffect(() => {
-    setLocationDraft(cloneLocations(locations));
     setSelectedLocationId((current) => current ?? locations[0]?.id ?? null);
   }, [locations]);
+
+  useEffect(() => {
+    if (!selectedLocationId || locations.some((location) => location.id === selectedLocationId)) {
+      return;
+    }
+
+    setSelectedLocationId(locations[0]?.id ?? null);
+  }, [locations, selectedLocationId]);
 
   useEffect(() => {
     if (!panelDragState) {
@@ -1114,7 +1496,27 @@ export default function App() {
   }, [panelDragState]);
 
   useEffect(() => {
-    if (!navigation || !world || !staffTest || localRunState !== 'running') {
+    if (!navigation || locations.length === 0) {
+      return;
+    }
+
+    const payload: LayoutPayload = {
+      version: 2,
+      mapWidth: MAP_WIDTH,
+      mapHeight: MAP_HEIGHT,
+      cellSize: navigation.cellSize,
+      walkableIndices: serializeWalkableIndices(navigation),
+      locations: cloneLocations(locations),
+      entranceIndex,
+      exitIndex,
+    };
+
+    window.localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(payload));
+  }, [entranceIndex, exitIndex, locations, navigation]);
+
+  useEffect(() => {
+    const shouldAnimate = localRunState === 'running' || apiSnapshot?.status.state === 'running';
+    if (!navigation || !world || !staffTest || !shouldAnimate) {
       return;
     }
 
@@ -1126,7 +1528,7 @@ export default function App() {
     return () => {
       window.clearInterval(intervalId);
     };
-  }, [locations, localRunState, navigation]);
+  }, [apiSnapshot?.status.state, locations, localRunState, navigation, staffTest, world]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1152,13 +1554,11 @@ export default function App() {
           setEmployeeSnapshot(employees);
           setApiMeta(meta);
           setApiConnected(true);
-          setApiLive(Boolean(meta.live));
         }
       } catch {
         if (!cancelled) {
           setApiMeta(null);
           setApiConnected(false);
-          setApiLive(false);
         }
       }
     }
@@ -1166,7 +1566,7 @@ export default function App() {
     void fetchApiStatus();
     const intervalId = window.setInterval(() => {
       void fetchApiStatus();
-    }, 1500);
+    }, 900);
 
     return () => {
       cancelled = true;
@@ -1176,6 +1576,10 @@ export default function App() {
 
   useEffect(() => {
     if (!employeeSnapshot || !navigation || !world || !staffTest) {
+      return;
+    }
+
+    if (world.testing || staffTest.testing) {
       return;
     }
 
@@ -1233,70 +1637,44 @@ export default function App() {
     });
   }, [employeeSnapshot, locations, navigation]);
 
-  useEffect(() => {
-    if (!apiConnected || !world || !staffTest) {
-      return;
-    }
-
-    const timeoutId = window.setTimeout(() => {
-      const payload = {
-        employees: buildEmployeeSyncEntries(world, staffTest, locations),
-      };
-
-      void fetch('/api/employees/sync', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(payload),
-      }).catch(() => undefined);
-    }, 250);
-
-    return () => {
-      window.clearTimeout(timeoutId);
-    };
-  }, [apiConnected, employeeSnapshot, locations, staffTest, world]);
-
-  function runTest(scriptQueues?: Record<string, string[]>) {
+  function runTest() {
     if (!navigation || locations.length < 2) {
       return;
     }
+
+    const fallbackDoors = defaultDoorIndices(navigation);
+    const entryCell = entranceIndex ?? fallbackDoors.entranceIndex;
 
     setWorld((current) => {
       if (!current) {
         return current;
       }
 
-      const { samQueue, jeremyQueue } = buildRandomScripts(current, locations);
-      const nextSamQueue = scriptQueues?.sam ?? samQueue;
-      const nextJeremyQueue = scriptQueues?.jeremy ?? jeremyQueue;
+      const samStart = actorProfiles.sam.startLocationId;
+      const jeremyStart = actorProfiles.jeremy.startLocationId;
 
       return {
         ...current,
         testing: true,
         actors: {
-          sam: {
-            ...current.actors.sam,
-            nextCell: null,
-            moveProgress: 0,
-            x: cellCenter(navigation, current.actors.sam.cell).x,
-            y: cellCenter(navigation, current.actors.sam.cell).y,
-            destinationId: null,
-            path: [],
-            scriptQueue: nextSamQueue,
-            frameIndex: idleFrame(current.actors.sam.direction),
-          },
-          jeremy: {
-            ...current.actors.jeremy,
-            nextCell: null,
-            moveProgress: 0,
-            x: cellCenter(navigation, current.actors.jeremy.cell).x,
-            y: cellCenter(navigation, current.actors.jeremy.cell).y,
-            destinationId: null,
-            path: [],
-            scriptQueue: nextJeremyQueue,
-            frameIndex: idleFrame(current.actors.jeremy.direction),
-          },
+          sam: resetRouteToCell(
+            current.actors.sam,
+            navigation,
+            entryCell,
+            'right',
+            null,
+            [samStart, ...buildTestLocationQueue(samStart, locations)],
+            entranceLaunchDelayTicks('sam'),
+          ),
+          jeremy: resetRouteToCell(
+            current.actors.jeremy,
+            navigation,
+            entryCell,
+            'right',
+            null,
+            [jeremyStart, ...buildTestLocationQueue(jeremyStart, locations)],
+            entranceLaunchDelayTicks('jeremy'),
+          ),
         },
       };
     });
@@ -1309,21 +1687,18 @@ export default function App() {
       const movers = Object.fromEntries(
         fixedStaffProfiles.map((profile) => {
           const mover = current.movers[profile.id] ?? createRouteState(navigation, locationById(profile.locationId, locations)?.marker ?? { x: 0, y: 0 }, profile.direction, profile.locationId);
-          const center = cellCenter(navigation, mover.cell);
 
           return [
             profile.id,
-            {
-              ...mover,
-              nextCell: null,
-              moveProgress: 0,
-              x: center.x,
-              y: center.y,
-              destinationId: null,
-              path: [],
-              scriptQueue: scriptQueues?.[profile.id] ?? buildRandomQueue(mover.currentLocationId ?? profile.locationId, locations),
-              frameIndex: idleFrame(mover.direction),
-            },
+            resetRouteToCell(
+              mover,
+              navigation,
+              entryCell,
+              'right',
+              null,
+              [profile.locationId, ...buildTestLocationQueue(profile.locationId, locations)],
+              entranceLaunchDelayTicks(profile.id),
+            ),
           ] as const;
         }),
       ) as Record<string, RouteState>;
@@ -1338,6 +1713,8 @@ export default function App() {
 
   function handleRun() {
     setLocalRunState('running');
+    setWorld((current) => (current ? { ...current, testing: false } : current));
+    setStaffTest((current) => (current ? { ...current, testing: false } : current));
 
     if (apiConnected) {
       void (async () => {
@@ -1354,8 +1731,10 @@ export default function App() {
     }
   }
 
-  function handlePause() {
+  function handleStop() {
     setLocalRunState('paused');
+    setWorld((current) => (current ? { ...current, testing: false } : current));
+    setStaffTest((current) => (current ? { ...current, testing: false } : current));
 
     if (apiConnected) {
       void (async () => {
@@ -1366,39 +1745,67 @@ export default function App() {
             setEmployeeSnapshot((await employeesResponse.json()) as ApiEmployeeSnapshot);
           }
         } catch {
-          // Ignore bridge failures and keep the local pause state.
+          // Ignore bridge failures and keep the local stop state.
         }
       })();
     }
   }
 
   function handleTest() {
-    setLocalRunState('running');
-    setSelectedStaffId(null);
+    const currentlyTesting = Boolean(world?.testing || staffTest?.testing);
 
     void (async () => {
-      try {
-        const response = await fetch('/api/test', { method: 'POST' });
-        if (!response.ok) {
-          throw new Error(`Test failed: ${response.status}`);
+      if (currentlyTesting) {
+        if (!navigation) {
+          return;
         }
 
-        const snapshot = (await response.json()) as ApiEmployeeSnapshot;
-        setEmployeeSnapshot(snapshot);
-        const queues = Object.fromEntries(snapshot.employees.map((employee) => [employee.id, employee.scriptQueue])) as Record<string, string[]>;
-        runTest(queues);
-      } catch {
-        runTest();
-      }
-    })();
-  }
+        if (apiConnected) {
+          try {
+            const [resetResponse, statusResponse] = await Promise.all([fetch('/api/reset', { method: 'POST' }), fetch('/api/status')]);
 
-  function applyLocationDraft(nextLocations: OfficeLocation[]) {
-    window.localStorage.setItem(LOCATION_STORAGE_KEY, JSON.stringify(nextLocations));
-    setLocations(nextLocations);
-    setLocationDraft(cloneLocations(nextLocations));
-    setWorld((current) => (current && navigation ? remapWorldToGrid(current, navigation, nextLocations) : current));
-    setStaffTest((current) => (current && navigation ? remapStaffTestToGrid(current, navigation, nextLocations) : current));
+            if (resetResponse.ok) {
+              setEmployeeSnapshot((await resetResponse.json()) as ApiEmployeeSnapshot);
+            }
+
+            if (statusResponse.ok) {
+              setApiSnapshot((await statusResponse.json()) as ApiRunnerSnapshot);
+            }
+          } catch {
+            // Ignore bridge failures and still restore local positions.
+          }
+        }
+
+        setLocalRunState('paused');
+        setSelectedStaffId(null);
+        setWorld(createWorldState(navigation, locations));
+        setStaffTest(createStaffTestState(navigation, locations));
+        return;
+      }
+
+      if (apiConnected) {
+        try {
+          await fetch('/api/stop', { method: 'POST' });
+          const [statusResponse, employeesResponse] = await Promise.all([fetch('/api/status'), fetch('/api/employees')]);
+
+          if (statusResponse.ok) {
+            setApiSnapshot((await statusResponse.json()) as ApiRunnerSnapshot);
+          }
+
+          if (employeesResponse.ok) {
+            setEmployeeSnapshot((await employeesResponse.json()) as ApiEmployeeSnapshot);
+          }
+        } catch {
+          // Ignore bridge failures; test mode is local-only and should still run.
+        }
+      }
+
+      setLocalRunState('running');
+      setSelectedStaffId(null);
+      setWorld((current) => (current ? { ...current, testing: true } : current));
+      setStaffTest((current) => (current ? { ...current, testing: true } : current));
+      runTest();
+    })();
   }
 
   function beginSettingsPanelDrag(event: ReactPointerEvent<HTMLDivElement>) {
@@ -1417,105 +1824,84 @@ export default function App() {
     });
   }
 
+  function applyLocationSet(nextLocations: OfficeLocation[]) {
+    setLocations(nextLocations);
+    setWorld((current) => (current && navigation ? remapWorldToGrid(current, navigation, nextLocations) : current));
+    setStaffTest((current) => (current && navigation ? remapStaffTestToGrid(current, navigation, nextLocations) : current));
+  }
+
   async function copySelectedGrid() {
-    if (!navigation || selectedGridCells.length === 0) {
+    if (!navigation) {
       return;
     }
 
-    const payload = {
-      version: 1,
+    const payload: LayoutPayload = {
+      version: 2,
       mapWidth: MAP_WIDTH,
       mapHeight: MAP_HEIGHT,
       cellSize: navigation.cellSize,
-      selectedCells: selectedGridCells
-        .slice()
-        .sort((a, b) => a - b)
-        .map((index) => ({
-          index,
-          col: index % navigation.cols,
-          row: Math.floor(index / navigation.cols),
-          walkable: navigation.walkable[index] === 1,
-        })),
+      walkableIndices: serializeWalkableIndices(navigation),
+      locations: cloneLocations(locations),
+      entranceIndex,
+      exitIndex,
     };
 
     try {
       await navigator.clipboard.writeText(JSON.stringify(payload, null, 2));
-      setCopyStatus('copied');
     } catch {
-      setCopyStatus('failed');
+      // Ignore clipboard failures.
     }
   }
 
-  function buildNavigationFromSelectedIndices(selectedIndices: number[]) {
-    const baseGrid = buildNavigationGrid();
-    const walkable = new Uint8Array(baseGrid.walkable.length);
+  function applyNavigationGrid(nextNavigation: NavigationGrid) {
+    const normalizedLocations = normalizeOfficeLocations(nextNavigation, locations);
+    const fallbackDoors = defaultDoorIndices(nextNavigation);
+    const nextEntrance = navigation && entranceIndex !== null ? closestWalkableIndex(nextNavigation, cellCenter(navigation, entranceIndex)) : fallbackDoors.entranceIndex;
+    const nextExit = navigation && exitIndex !== null ? closestWalkableIndex(nextNavigation, cellCenter(navigation, exitIndex)) : fallbackDoors.exitIndex;
 
-    for (const index of selectedIndices) {
-      if (index >= 0 && index < walkable.length) {
-        walkable[index] = 1;
-      }
-    }
-
-    return {
-      ...baseGrid,
-      walkable,
-    };
-  }
-
-  function serializeWalkableIndices(grid: NavigationGrid) {
-    const indices: number[] = [];
-
-    for (let index = 0; index < grid.walkable.length; index += 1) {
-      if (grid.walkable[index] === 1) {
-        indices.push(index);
-      }
-    }
-
-    return indices;
-  }
-
-  function applyNavigationGrid(nextNavigation: NavigationGrid, selectionIndices: number[]) {
-    const normalizedLocations = normalizeOfficeLocations(nextNavigation, locationDraft.length > 0 ? locationDraft : locations);
-    window.localStorage.setItem(PATH_STORAGE_KEY, JSON.stringify(serializeWalkableIndices(nextNavigation)));
-    window.localStorage.setItem(LOCATION_STORAGE_KEY, JSON.stringify(normalizedLocations));
-    window.localStorage.setItem(GRID_SELECTION_STORAGE_KEY, JSON.stringify(selectionIndices));
     setNavigation(nextNavigation);
     setLocations(normalizedLocations);
-    setLocationDraft(cloneLocations(normalizedLocations));
-    setSelectedGridCells(selectionIndices);
+    setEntranceIndex(nextEntrance);
+    setExitIndex(nextExit);
     setWorld((current) => (current ? remapWorldToGrid(current, nextNavigation, normalizedLocations) : createWorldState(nextNavigation, normalizedLocations)));
     setStaffTest((current) =>
       current ? remapStaffTestToGrid(current, nextNavigation, normalizedLocations) : createStaffTestState(nextNavigation, normalizedLocations),
     );
   }
 
-  function handleApplySelectedGrid() {
-    if (selectedGridCells.length === 0) {
-      setApplyStatus('failed');
+  function updateWalkwayCell(index: number, walkable: boolean) {
+    if (!navigation) {
       return;
     }
 
-    const nextNavigation = buildNavigationFromSelectedIndices(selectedGridCells);
-    applyNavigationGrid(nextNavigation, selectedGridCells);
-    setApplyStatus('applied');
+    const nextNavigation = {
+      ...navigation,
+      walkable: new Uint8Array(navigation.walkable),
+    };
+    nextNavigation.walkable[index] = walkable ? 1 : 0;
+
+    if (serializeWalkableIndices(nextNavigation).length === 0) {
+      return;
+    }
+
+    applyNavigationGrid(nextNavigation);
   }
 
   function placeSelectedLocation(index: number) {
-    const cell = gridCells[index];
-    if (!cell || !selectedLocationId) {
+    if (!navigation || !selectedLocationId || navigation.walkable[index] !== 1) {
       return;
     }
 
-    setLocationApplyStatus('idle');
-    setLocationDraft((current) =>
-      current.map((location) =>
+    const point = cellCenter(navigation, index);
+    applyLocationSet(
+      locations.map((location) =>
         location.id === selectedLocationId
           ? {
               ...location,
-              marker: { x: cell.centerX, y: cell.centerY },
+              marker: point,
               targets: {
-                sam: { x: cell.centerX, y: cell.centerY },
-                jeremy: { x: cell.centerX, y: cell.centerY },
+                sam: point,
+                jeremy: point,
               },
             }
           : location,
@@ -1523,48 +1909,162 @@ export default function App() {
     );
   }
 
-  function handleApplyLocations() {
-    if (locationDraft.length === 0) {
+  function placeDoor(index: number, type: 'entrance' | 'exit') {
+    if (!navigation || navigation.walkable[index] !== 1) {
       return;
     }
 
-    applyLocationDraft(locationDraft);
-    setLocationApplyStatus('applied');
+    if (type === 'entrance') {
+      setEntranceIndex(index);
+      return;
+    }
+
+    setExitIndex(index);
   }
 
-  function handleResetLocations() {
-    setLocationDraft(cloneLocations(locations));
-    setSelectedLocationId((current) => current ?? locations[0]?.id ?? null);
-    setLocationApplyStatus('idle');
-  }
-
-  function handleApplyGridJson() {
+  function createLocation() {
     if (!navigation) {
-      setApplyStatus('failed');
       return;
     }
 
-    try {
-      const parsed = JSON.parse(gridJsonInput) as GridSelectionPayload;
-      if (
-        !parsed ||
-        parsed.mapWidth !== MAP_WIDTH ||
-        parsed.mapHeight !== MAP_HEIGHT ||
-        parsed.cellSize !== navigation.cellSize ||
-        !Array.isArray(parsed.selectedCells)
-      ) {
-        throw new Error('Invalid grid payload');
-      }
-
-      const selectedIndices = parsed.selectedCells.filter((cell) => cell.walkable).map((cell) => cell.index);
-      const allSelectionIndices = parsed.selectedCells.map((cell) => cell.index);
-      const nextNavigation = buildNavigationFromSelectedIndices(selectedIndices);
-      applyNavigationGrid(nextNavigation, allSelectionIndices);
-      setGridJsonInput('');
-      setApplyStatus('applied');
-    } catch {
-      setApplyStatus('failed');
+    const label = newLocationLabel.trim();
+    const id = (newLocationId.trim() || slugifyLocationId(label)).trim();
+    if (!label || !id || locations.some((location) => location.id === id)) {
+      return;
     }
+
+    const fallbackDoors = defaultDoorIndices(navigation);
+    const placementIndex =
+      selectedCellIndex !== null && navigation.walkable[selectedCellIndex] === 1
+        ? selectedCellIndex
+        : entranceIndex ?? fallbackDoors.entranceIndex;
+    const point = cellCenter(navigation, placementIndex);
+
+    applyLocationSet([
+      ...locations,
+      {
+        id,
+        label,
+        marker: point,
+        targets: {
+          sam: point,
+          jeremy: point,
+        },
+      },
+    ]);
+    setSelectedLocationId(id);
+    setConsoleTool('place-location');
+    setNewLocationLabel('');
+    setNewLocationId('');
+  }
+
+  function handleResetLayout() {
+    if (!navigation) {
+      return;
+    }
+
+    const defaults = createDefaultLayout();
+    setNavigation(defaults.navigation);
+    setLocations(defaults.locations);
+    setSelectedLocationId(defaults.locations[0]?.id ?? null);
+    setEntranceIndex(defaults.entranceIndex);
+    setExitIndex(defaults.exitIndex);
+    setSelectedCellIndex(null);
+    setWorld(createWorldState(defaults.navigation, defaults.locations));
+    setStaffTest(createStaffTestState(defaults.navigation, defaults.locations));
+  }
+
+  function handleClearEverything() {
+    const emptyNavigation = createEmptyNavigationGrid();
+    setNavigation(emptyNavigation);
+    setLocations([]);
+    setSelectedLocationId(null);
+    setEntranceIndex(null);
+    setExitIndex(null);
+    setSelectedCellIndex(null);
+    setNewLocationLabel('');
+    setNewLocationId('');
+    setWorld(createWorldState(emptyNavigation, []));
+    setStaffTest(createStaffTestState(emptyNavigation, []));
+  }
+
+  function gridIndexFromClientPosition(clientX: number, clientY: number) {
+    if (!navigation || !gridOverlayRef.current) {
+      return null;
+    }
+
+    const rect = gridOverlayRef.current.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      return null;
+    }
+
+    const relativeX = ((clientX - rect.left) / rect.width) * MAP_WIDTH;
+    const relativeY = ((clientY - rect.top) / rect.height) * MAP_HEIGHT;
+
+    if (relativeX < 0 || relativeY < 0 || relativeX > MAP_WIDTH || relativeY > MAP_HEIGHT) {
+      return null;
+    }
+
+    return gridIndexForPoint(navigation, { x: relativeX, y: relativeY });
+  }
+
+  function paintGridFromPointer(clientX: number, clientY: number) {
+    if (!settingsOpen || !gridSelectionMode) {
+      return;
+    }
+
+    const index = gridIndexFromClientPosition(clientX, clientY);
+    if (index === null) {
+      return;
+    }
+
+    setSelectedCellIndex(index);
+    updateWalkwayCell(index, gridSelectionMode === 'add');
+  }
+
+  function handleGridCellPointerDown(index: number) {
+    if (!navigation) {
+      return;
+    }
+
+    setSelectedCellIndex(index);
+
+    if (consoleTool === 'add-walkway' || consoleTool === 'remove-walkway') {
+      const paintMode = consoleTool === 'add-walkway' ? 'add' : 'remove';
+      setGridSelectionMode(paintMode);
+      updateWalkwayCell(index, paintMode === 'add');
+      return;
+    }
+
+    if (consoleTool === 'place-location') {
+      placeSelectedLocation(index);
+      return;
+    }
+
+    if (consoleTool === 'place-entrance') {
+      placeDoor(index, 'entrance');
+      return;
+    }
+
+    if (consoleTool === 'place-exit') {
+      placeDoor(index, 'exit');
+    }
+  }
+
+  function handleGridCellPointerEnter(index: number) {
+    if (!settingsOpen || !gridSelectionMode) {
+      return;
+    }
+
+    updateWalkwayCell(index, gridSelectionMode === 'add');
+  }
+
+  function handleGridOverlayPointerMove(event: ReactPointerEvent<HTMLDivElement>) {
+    if ((event.buttons & 1) === 0) {
+      return;
+    }
+
+    paintGridFromPointer(event.clientX, event.clientY);
   }
 
   if (!navigation || !world || !staffTest) {
@@ -1578,47 +2078,67 @@ export default function App() {
   }
 
   const isTesting = world.testing || staffTest.testing;
-  const runtimeBadgeLabel = apiLive ? 'Live' : 'Not live';
-  const runtimeBadgeClass = apiLive ? 'is-live' : 'is-local';
-  const dashboardRequests = employeeSnapshot ? employeeSnapshot.usage.requestCount.toLocaleString() : apiConnected && apiLive ? '--' : '0';
-  const dashboardTokens = employeeSnapshot ? employeeSnapshot.usage.totalTokens.toLocaleString() : apiConnected && apiLive ? '--' : '0';
-  const dashboardCost = employeeSnapshot ? `$${employeeSnapshot.usage.estimatedCostUsd.toFixed(2)}` : apiConnected && apiLive ? '--' : '$0.00';
+  const runnerStatus = apiSnapshot?.status.state ?? localRunState;
+  const apiLiveConfigured = Boolean(apiConnected && apiMeta?.live);
+  const isLiveSpending = apiLiveConfigured && runnerStatus === 'running' && !isTesting;
+  const dashboardRequests = employeeSnapshot ? employeeSnapshot.usage.requestCount.toLocaleString() : apiConnected && apiLiveConfigured ? '--' : '0';
+  const dashboardTokens = employeeSnapshot ? employeeSnapshot.usage.totalTokens.toLocaleString() : apiConnected && apiLiveConfigured ? '--' : '0';
+  const dashboardCost = employeeSnapshot ? `$${employeeSnapshot.usage.estimatedCostUsd.toFixed(2)}` : apiConnected && apiLiveConfigured ? '--' : '$0.00';
+  const modelBreakdown = employeeSnapshot?.usage.byModel ?? [];
   const transportLabel =
     apiMeta?.transport === 'proxy'
-      ? `Proxy${apiMeta.model ? ` · ${apiMeta.model}` : ''}`
+      ? `Proxy${apiMeta.model ? ` · ${apiMeta.model}` : ''}${modelBreakdown.length > 1 ? ' + routing' : ''}`
       : apiMeta?.transport === 'direct'
-        ? `Direct${apiMeta.model ? ` · ${apiMeta.model}` : ''}`
+        ? `Direct${apiMeta.model ? ` · ${apiMeta.model}` : ''}${modelBreakdown.length > 1 ? ' + routing' : ''}`
         : 'Local scripted';
   const runtimeUsageLabel = employeeSnapshot
     ? `${employeeSnapshot.usage.requestCount.toLocaleString()} req · ${employeeSnapshot.usage.totalTokens.toLocaleString()} tok · $${employeeSnapshot.usage.estimatedCostUsd.toFixed(4)}`
-    : apiConnected && apiLive
+    : apiConnected && apiLiveConfigured
       ? '-- req · -- tok · --'
       : '0 req · 0 tok · $0.0000';
-  const runnerStatus = apiSnapshot?.status.state ?? localRunState;
-  const shouldShowGrid = settingsOpen && settingsSection === 'grid' && view === 'office';
-  const shouldShowLocationEditor = settingsOpen && settingsSection === 'locations' && view === 'office';
-  const selectedWalkableCount = selectedGridCells.reduce((total, index) => total + (navigation.walkable[index] === 1 ? 1 : 0), 0);
-  const visibleLocations = shouldShowLocationEditor ? locationDraft : locations;
-  const selectedLocation = locationDraft.find((location) => location.id === selectedLocationId) ?? null;
+  const modeLabel = isTesting
+    ? 'Local scripted test'
+    : isLiveSpending
+      ? 'Live tokens in use'
+      : apiLiveConfigured
+        ? 'Ready for live run'
+        : 'Local scripted mode';
+  const shouldShowGrid = settingsOpen;
+  const selectedWalkableCount = navigation.walkable.reduce((total, cell) => total + (cell === 1 ? 1 : 0), 0);
+  const selectedLocation = locations.find((location) => location.id === selectedLocationId) ?? null;
+  const selectedCell = selectedCellIndex !== null ? gridCells[selectedCellIndex] ?? null : null;
+  const selectedColumn = selectedCell ? gridColumns[selectedCell.col] ?? null : null;
+  const entranceCell = entranceIndex !== null ? gridCells[entranceIndex] ?? null : null;
+  const exitCell = exitIndex !== null ? gridCells[exitIndex] ?? null : null;
+  const crowdOffsetsByEntity = new Map<string, { x: number; y: number }>();
+  const occupantsByCell = new Map<number, string[]>();
 
-  function updateGridSelection(index: number, modeOverride?: 'add' | 'remove') {
-    setCopyStatus('idle');
-    setSelectedGridCells((current) => {
-      const isSelected = current.includes(index);
-      const mode = modeOverride ?? gridSelectionMode ?? (isSelected ? 'remove' : 'add');
+  for (const actorId of actorIds) {
+    const actor = world.actors[actorId];
+    if (actor.nextCell !== null) {
+      continue;
+    }
 
-      if (mode === 'add') {
-        return isSelected ? current : [...current, index];
-      }
-
-      return current.filter((cellIndex) => cellIndex !== index);
-    });
+    const occupants = occupantsByCell.get(actor.cell) ?? [];
+    occupants.push(actorId);
+    occupantsByCell.set(actor.cell, occupants);
   }
 
-  function beginGridSelection(index: number) {
-    const nextMode = selectedGridCellSet.has(index) ? 'remove' : 'add';
-    setGridSelectionMode(nextMode);
-    updateGridSelection(index, nextMode);
+  for (const profile of fixedStaffProfiles) {
+    const mover = staffTest.movers[profile.id];
+    if (!mover || mover.nextCell !== null) {
+      continue;
+    }
+
+    const occupants = occupantsByCell.get(mover.cell) ?? [];
+    occupants.push(profile.id);
+    occupantsByCell.set(mover.cell, occupants);
+  }
+
+  for (const occupants of occupantsByCell.values()) {
+    occupants.forEach((id, index) => {
+      crowdOffsetsByEntity.set(id, crowdOffset(index, occupants.length));
+    });
   }
 
   const staffDossiers = [
@@ -1629,10 +2149,20 @@ export default function App() {
       position: employeeById(employeeSnapshot, 'sam')?.position ?? actorProfiles.sam.thought.title,
       status: employeeById(employeeSnapshot, 'sam')?.status ?? actorStatusText(world.actors.sam, locations),
       bio: employeeById(employeeSnapshot, 'sam')?.bio ?? 'Steady and patient, Sam keeps the front-end work calm and organized.',
+      objective:
+        employeeById(employeeSnapshot, 'sam')?.objective ?? 'Keep the React lane moving without dropping review discipline.',
+      currentAction: employeeById(employeeSnapshot, 'sam')?.currentAction ?? null,
       location:
         locationById(employeeById(employeeSnapshot, 'sam')?.currentLocationId ?? world.actors.sam.currentLocationId ?? actorProfiles.sam.startLocationId, locations)?.label ??
         'Unknown',
       checklist: employeeById(employeeSnapshot, 'sam')?.checklist ?? actorProfiles.sam.thought.checklist,
+      activeMemory: employeeById(employeeSnapshot, 'sam')?.activeMemory ?? [],
+      passiveMemoryCount: employeeById(employeeSnapshot, 'sam')?.passiveMemoryCount ?? 0,
+      privateNoteCount: employeeById(employeeSnapshot, 'sam')?.privateNoteCount ?? 0,
+      currentEmailSubject: employeeById(employeeSnapshot, 'sam')?.currentEmailSubject ?? null,
+      inboundRequests: employeeById(employeeSnapshot, 'sam')?.inboundRequests ?? [],
+      outboundRequests: employeeById(employeeSnapshot, 'sam')?.outboundRequests ?? [],
+      performance: employeeById(employeeSnapshot, 'sam')?.performance ?? null,
     },
     {
       id: 'jeremy-dossier',
@@ -1641,10 +2171,20 @@ export default function App() {
       position: employeeById(employeeSnapshot, 'jeremy')?.position ?? actorProfiles.jeremy.thought.title,
       status: employeeById(employeeSnapshot, 'jeremy')?.status ?? actorStatusText(world.actors.jeremy, locations),
       bio: employeeById(employeeSnapshot, 'jeremy')?.bio ?? 'Direct and reliable, Jeremy likes quick fixes that remove blockers fast.',
+      objective:
+        employeeById(employeeSnapshot, 'jeremy')?.objective ?? 'Keep the React lane moving without dropping review discipline.',
+      currentAction: employeeById(employeeSnapshot, 'jeremy')?.currentAction ?? null,
       location:
         locationById(employeeById(employeeSnapshot, 'jeremy')?.currentLocationId ?? world.actors.jeremy.currentLocationId ?? actorProfiles.jeremy.startLocationId, locations)?.label ??
         'Unknown',
       checklist: employeeById(employeeSnapshot, 'jeremy')?.checklist ?? actorProfiles.jeremy.thought.checklist,
+      activeMemory: employeeById(employeeSnapshot, 'jeremy')?.activeMemory ?? [],
+      passiveMemoryCount: employeeById(employeeSnapshot, 'jeremy')?.passiveMemoryCount ?? 0,
+      privateNoteCount: employeeById(employeeSnapshot, 'jeremy')?.privateNoteCount ?? 0,
+      currentEmailSubject: employeeById(employeeSnapshot, 'jeremy')?.currentEmailSubject ?? null,
+      inboundRequests: employeeById(employeeSnapshot, 'jeremy')?.inboundRequests ?? [],
+      outboundRequests: employeeById(employeeSnapshot, 'jeremy')?.outboundRequests ?? [],
+      performance: employeeById(employeeSnapshot, 'jeremy')?.performance ?? null,
     },
     ...fixedStaffProfiles.map((staff) => {
       const mover = staffTest.movers[staff.id];
@@ -1656,6 +2196,8 @@ export default function App() {
         position: backendEmployee?.position ?? staff.position,
         status: backendEmployee?.status ?? staffStatusText(mover, staff, locations),
         bio: backendEmployee?.bio ?? staff.bio,
+        objective: backendEmployee?.objective ?? `${staff.position} is keeping their lane moving inside office policy.`,
+        currentAction: backendEmployee?.currentAction ?? null,
         location: locationById(backendEmployee?.currentLocationId ?? mover?.currentLocationId ?? staff.locationId, locations)?.label ?? staff.position,
         checklist:
           backendEmployee?.checklist ?? [
@@ -1663,6 +2205,13 @@ export default function App() {
             `Assigned to ${staff.position}`,
             `Stationed at ${locationById(staff.locationId, locations)?.label ?? staff.position}`,
           ],
+        activeMemory: backendEmployee?.activeMemory ?? [],
+        passiveMemoryCount: backendEmployee?.passiveMemoryCount ?? 0,
+        privateNoteCount: backendEmployee?.privateNoteCount ?? 0,
+        currentEmailSubject: backendEmployee?.currentEmailSubject ?? null,
+        inboundRequests: backendEmployee?.inboundRequests ?? [],
+        outboundRequests: backendEmployee?.outboundRequests ?? [],
+        performance: backendEmployee?.performance ?? null,
       };
     }),
   ];
@@ -1670,35 +2219,30 @@ export default function App() {
   return (
     <main className="sim-shell">
       <div className="nav-bar">
-        <button
-          aria-label="Settings"
-          className={`nav-button icon-button ${settingsOpen ? 'is-active' : ''}`}
-          onClick={() => {
-            setSettingsOpen((current) => !current);
-            setCopyStatus('idle');
-          }}
-          type="button"
-        >
-          ⚙
-        </button>
         <button className="nav-button" onClick={() => setView((current) => (current === 'office' ? 'dashboard' : 'office'))} type="button">
           {view === 'office' ? 'Dashboard' : 'Office'}
+        </button>
+        <button className={`nav-button ${settingsOpen ? 'is-active' : ''}`} onClick={() => setSettingsOpen((current) => !current)} type="button">
+          Grid Console
         </button>
       </div>
 
       <div className="runtime-bar">
-        <button className="runtime-button" onClick={handleRun} type="button">
-          Run
-        </button>
-        <button className="runtime-button" disabled={localRunState !== 'running'} onClick={handlePause} type="button">
-          Pause
+        <button
+          className={`runtime-button ${runnerStatus === 'running' && !isTesting ? 'is-accent' : ''}`}
+          onClick={runnerStatus === 'running' && !isTesting ? handleStop : handleRun}
+          type="button"
+        >
+          {runnerStatus === 'running' && !isTesting ? 'Stop' : 'Run'}
         </button>
         <button className={`runtime-button ${isTesting ? 'is-accent' : ''}`} onClick={handleTest} type="button">
           Test
         </button>
-        <button className={`runtime-button live-button ${runtimeBadgeClass}`} disabled type="button">
-          {runtimeBadgeLabel}
-        </button>
+        {isLiveSpending ? (
+          <button className="runtime-button live-button is-live" disabled type="button">
+            Live
+          </button>
+        ) : null}
         <div aria-live="polite" className="runtime-usage">
           {runtimeUsageLabel}
         </div>
@@ -1708,144 +2252,156 @@ export default function App() {
         <aside className="settings-panel" style={{ left: settingsPanelPosition.x, top: settingsPanelPosition.y }}>
           <div className="settings-header">
             <div className={`settings-drag-handle ${panelDragState ? 'is-dragging' : ''}`} onPointerDown={beginSettingsPanelDrag} role="presentation">
-              <p className="editor-eyebrow">Settings</p>
+              <p className="editor-eyebrow">Grid Console</p>
               <span>Move</span>
             </div>
             <div className="settings-header-actions">
-              <button
-                className="settings-close"
-                onClick={() => {
-                  setSettingsOpen(false);
-                  setCopyStatus('idle');
-                }}
-                type="button"
-              >
+              <button className="settings-close" onClick={() => setSettingsOpen(false)} type="button">
                 Close
               </button>
             </div>
           </div>
 
           <div className="settings-tabs">
-            <button
-              className={`settings-tab ${settingsSection === 'grid' ? 'is-active' : ''}`}
-              onClick={() => setSettingsSection('grid')}
-              type="button"
-            >
-              Grid
+            <button className={`settings-tab ${consoleSection === 'walkways' ? 'is-active' : ''}`} onClick={() => setConsoleSection('walkways')} type="button">
+              Walkways
             </button>
-            <button
-              className={`settings-tab ${settingsSection === 'locations' ? 'is-active' : ''}`}
-              onClick={() => setSettingsSection('locations')}
-              type="button"
-            >
+            <button className={`settings-tab ${consoleSection === 'locations' ? 'is-active' : ''}`} onClick={() => setConsoleSection('locations')} type="button">
               Locations
+            </button>
+            <button className={`settings-tab ${consoleSection === 'doors' ? 'is-active' : ''}`} onClick={() => setConsoleSection('doors')} type="button">
+              Entrance / Exit
             </button>
           </div>
 
-          {settingsSection === 'grid' ? (
-            <div className="settings-section">
-              <p className="settings-copy">This is the live navigation grid the staff are routing on right now. Click or drag across cells to multi-select them.</p>
-
-              <div className="settings-actions">
-                <button className="settings-action" onClick={() => setSelectedGridCells([])} type="button">
-                  Clear
-                </button>
-                <button className="settings-action" onClick={() => setSelectedGridCells(gridCells.filter((cell) => navigation.walkable[cell.index] === 1).map((cell) => cell.index))} type="button">
-                  Select walkable
-                </button>
-                <button className="settings-action" onClick={() => setRevealLocations((current) => !current)} type="button">
-                  {revealLocations ? 'Hide locations' : 'Reveal locations'}
-                </button>
-                <button className="settings-action is-primary" disabled={selectedGridCells.length === 0} onClick={copySelectedGrid} type="button">
-                  Copy selection
-                </button>
-                <button className="settings-action is-primary" disabled={selectedGridCells.length === 0} onClick={handleApplySelectedGrid} type="button">
-                  Apply selection
-                </button>
-              </div>
-
-              <div className="settings-metrics">
-                <span>{selectedGridCells.length} selected</span>
-                <span>{selectedWalkableCount} walkable</span>
-                <span>{copyStatus === 'copied' ? 'Copied' : copyStatus === 'failed' ? 'Copy failed' : 'Ready'}</span>
-                <span>{applyStatus === 'applied' ? 'Applied' : applyStatus === 'failed' ? 'Apply failed' : 'Idle'}</span>
-              </div>
-
-              <div className="grid-import-panel">
-                <label className="grid-import-label" htmlFor="grid-json-input">
-                  Paste grid JSON
-                </label>
-                <textarea
-                  className="grid-import-textarea"
-                  id="grid-json-input"
-                  onChange={(event) => {
-                    setGridJsonInput(event.target.value);
-                    setApplyStatus('idle');
-                  }}
-                  placeholder="Paste copied grid JSON here, then click Apply pasted grid."
-                  value={gridJsonInput}
-                />
-                <button className="settings-action is-primary" disabled={gridJsonInput.trim().length === 0} onClick={handleApplyGridJson} type="button">
-                  Apply pasted grid
-                </button>
-              </div>
-
-              {revealLocations ? (
-                <div className="settings-location-list">
-                  {visibleLocations.map((location) => {
-                    const cellIndex = closestWalkableIndex(navigation, location.marker);
-                    return (
-                      <div className="settings-location-row" key={location.id}>
-                        <span>{location.label}</span>
-                        <span>
-                          c{cellIndex % navigation.cols} r{Math.floor(cellIndex / navigation.cols)}
-                        </span>
-                      </div>
-                    );
-                  })}
-                </div>
-              ) : null}
+          <div className="settings-section">
+            <p className="settings-copy">
+              The overlay now matches the image bounds exactly. Pick a tool, then click the map to paint walkways, place locations, or set the entrance and exit cells.
+            </p>
+            <div className="settings-metrics">
+              <span>{navigation.cols} columns</span>
+              <span>{navigation.rows} rows</span>
+              <span>{selectedWalkableCount} walkable cells</span>
+              <span>{locations.length} locations</span>
             </div>
-          ) : null}
 
-          {settingsSection === 'locations' ? (
-            <div className="settings-section">
-              <p className="settings-copy">Pick a location, then click any cell on the map to place it exactly there.</p>
-
-              <div className="settings-actions">
-                <button className="settings-action" onClick={() => setRevealLocations((current) => !current)} type="button">
-                  {revealLocations ? 'Hide locations' : 'Reveal locations'}
-                </button>
-                <button className="settings-action" onClick={handleResetLocations} type="button">
-                  Reset draft
-                </button>
-                <button className="settings-action is-primary" onClick={handleApplyLocations} type="button">
-                  Apply locations
-                </button>
+            {selectedCell ? (
+              <div className="settings-readout">
+                <p className="settings-readout-title">Selected Cell</p>
+                <p>
+                  Cell {selectedCell.index} · col {selectedCell.col} · row {selectedCell.row}
+                </p>
+                {selectedColumn ? (
+                  <p>
+                    Column x: {Math.round(selectedColumn.startX)}-{Math.round(selectedColumn.endX)} · center {Math.round(selectedColumn.centerX)}
+                  </p>
+                ) : null}
+                <p>
+                  World: {Math.round(selectedCell.centerX)}, {Math.round(selectedCell.centerY)}
+                </p>
+                <p>{navigation.walkable[selectedCell.index] === 1 ? 'Walkable' : 'Blocked'}</p>
               </div>
+            ) : null}
 
-              <div className="settings-metrics">
-                <span>{selectedLocation?.label ?? 'No location selected'}</span>
-                <span>{locationApplyStatus === 'applied' ? 'Applied' : 'Draft'}</span>
-              </div>
-
-              <div className="settings-location-list">
-                {locationDraft.map((location) => (
+            {consoleSection === 'walkways' ? (
+              <>
+                <div className="settings-actions">
                   <button
-                    className={`settings-location-button ${location.id === selectedLocationId ? 'is-active' : ''}`}
-                    key={location.id}
-                    onClick={() => setSelectedLocationId(location.id)}
+                    className={`settings-action ${consoleTool === 'add-walkway' ? 'is-primary' : ''}`}
+                    onClick={() => setConsoleTool((current) => (current === 'add-walkway' ? null : 'add-walkway'))}
                     type="button"
                   >
-                    <span>{location.label}</span>
-                    <span>
-                      c{exactCellIndexForPoint(navigation, location.marker) % navigation.cols} r{Math.floor(exactCellIndexForPoint(navigation, location.marker) / navigation.cols)}
-                    </span>
+                    Paint Walkway
                   </button>
-                ))}
-              </div>
-            </div>
-          ) : null}
+                  <button
+                    className={`settings-action ${consoleTool === 'remove-walkway' ? 'is-primary' : ''}`}
+                    onClick={() => setConsoleTool((current) => (current === 'remove-walkway' ? null : 'remove-walkway'))}
+                    type="button"
+                  >
+                    Erase Walkway
+                  </button>
+                  <button className="settings-action" onClick={() => void copySelectedGrid()} type="button">
+                    Copy Layout JSON
+                  </button>
+                  <button className="settings-action" onClick={handleClearEverything} type="button">
+                    Clear Everything
+                  </button>
+                  <button className="settings-action" onClick={handleResetLayout} type="button">
+                    Reset Defaults
+                  </button>
+                </div>
+                <p className="settings-copy">Click and hold to draw continuous walkway lines. The pathfinder uses only the green cells.</p>
+              </>
+            ) : null}
+
+            {consoleSection === 'locations' ? (
+              <>
+                <div className="settings-actions">
+                  <button
+                    className={`settings-action ${consoleTool === 'place-location' ? 'is-primary' : ''}`}
+                    onClick={() => setConsoleTool((current) => (current === 'place-location' ? null : 'place-location'))}
+                    type="button"
+                  >
+                    Place Selected
+                  </button>
+                </div>
+                <div className="settings-form">
+                  <label className="settings-field">
+                    <span>New location label</span>
+                    <input onChange={(event) => setNewLocationLabel(event.target.value)} type="text" value={newLocationLabel} />
+                  </label>
+                  <label className="settings-field">
+                    <span>Location id</span>
+                    <input onChange={(event) => setNewLocationId(event.target.value)} placeholder="auto from label" type="text" value={newLocationId} />
+                  </label>
+                  <button className="settings-action is-primary" onClick={createLocation} type="button">
+                    Create Location
+                  </button>
+                </div>
+                <div className="settings-location-list">
+                  {locations.map((location) => (
+                    <button
+                      className={`settings-location-button ${location.id === selectedLocationId ? 'is-active' : ''}`}
+                      key={location.id}
+                      onClick={() => setSelectedLocationId(location.id)}
+                      type="button"
+                    >
+                      <span>{location.label}</span>
+                      <span>{location.id}</span>
+                    </button>
+                  ))}
+                </div>
+                {selectedLocation ? <p className="settings-copy">Selected location: {selectedLocation.label}. Choose "Place Selected" and click a walkable cell.</p> : null}
+              </>
+            ) : null}
+
+            {consoleSection === 'doors' ? (
+              <>
+                <div className="settings-actions">
+                  <button
+                    className={`settings-action ${consoleTool === 'place-entrance' ? 'is-primary' : ''}`}
+                    onClick={() => setConsoleTool((current) => (current === 'place-entrance' ? null : 'place-entrance'))}
+                    type="button"
+                  >
+                    Place Entrance
+                  </button>
+                  <button
+                    className={`settings-action ${consoleTool === 'place-exit' ? 'is-primary' : ''}`}
+                    onClick={() => setConsoleTool((current) => (current === 'place-exit' ? null : 'place-exit'))}
+                    type="button"
+                  >
+                    Place Exit
+                  </button>
+                </div>
+                <div className="settings-readout">
+                  <p className="settings-readout-title">Door Cells</p>
+                  <p>Entrance: {entranceCell ? `cell ${entranceCell.index} · ${Math.round(entranceCell.centerX)}, ${Math.round(entranceCell.centerY)}` : 'unset'}</p>
+                  <p>Exit: {exitCell ? `cell ${exitCell.index} · ${Math.round(exitCell.centerX)}, ${Math.round(exitCell.centerY)}` : 'unset'}</p>
+                </div>
+                <p className="settings-copy">Test mode now starts everyone from the entrance cell, then routes them to their assigned desks before random motion begins.</p>
+              </>
+            ) : null}
+          </div>
         </aside>
       ) : null}
 
@@ -1860,7 +2416,7 @@ export default function App() {
             <div className="dashboard-metrics">
               <div className="metric-card">
                 <span className="metric-label">Mode</span>
-                <strong>{apiLive ? 'Live planner enabled' : 'Local scripted test'}</strong>
+                <strong>{modeLabel}</strong>
               </div>
               <div className="metric-card">
                 <span className="metric-label">Requests</span>
@@ -1886,6 +2442,82 @@ export default function App() {
           </header>
 
           <div className="dashboard-scroll">
+            <div className="dashboard-panels">
+              <article className="dashboard-sidecard">
+                <p className="sidecard-label">Red Terminal</p>
+                <strong className="sidecard-value">
+                  {employeeSnapshot?.terminal?.openCount ?? 0} open
+                </strong>
+                <ul className="sidecard-list">
+                  {(employeeSnapshot?.terminal?.items ?? []).slice(0, 4).map((item) => (
+                    <li key={item.id}>
+                      <span>{item.title}</span>
+                      <span>{item.priority}</span>
+                    </li>
+                  ))}
+                  {!employeeSnapshot?.terminal?.items?.length ? <li>No active escalations</li> : null}
+                </ul>
+              </article>
+
+              <article className="dashboard-sidecard">
+                <p className="sidecard-label">Office State</p>
+                <strong className="sidecard-value">
+                  {employeeSnapshot?.summary?.pendingRequests ?? 0} pending requests
+                </strong>
+                <ul className="sidecard-list">
+                  <li>Working: {employeeSnapshot?.summary?.employeesWorking ?? 0}</li>
+                  <li>Waiting: {employeeSnapshot?.summary?.employeesWaiting ?? 0}</li>
+                  <li>Open terminal: {employeeSnapshot?.summary?.openTerminal ?? 0}</li>
+                  <li>Total requests: {employeeSnapshot?.requests?.length ?? 0}</li>
+                </ul>
+              </article>
+
+              <article className="dashboard-sidecard">
+                <p className="sidecard-label">Playbook</p>
+                <strong className="sidecard-value">{employeeSnapshot?.playbook?.length ?? 0} rules</strong>
+                <ul className="sidecard-list">
+                  {(employeeSnapshot?.playbook ?? []).map((rule) => (
+                    <li key={rule.id}>{rule.title}</li>
+                  ))}
+                </ul>
+              </article>
+
+              <article className="dashboard-sidecard">
+                <p className="sidecard-label">Archives</p>
+                <strong className="sidecard-value">{employeeSnapshot?.knowledgeBase?.length ?? 0} shared notes</strong>
+                <ul className="sidecard-list">
+                  {(employeeSnapshot?.knowledgeBase ?? []).map((note) => (
+                    <li key={note.id}>
+                      <span>{note.title}</span>
+                      <span>{note.summary}</span>
+                    </li>
+                  ))}
+                </ul>
+              </article>
+
+              <article className="dashboard-sidecard">
+                <p className="sidecard-label">Email Simulator</p>
+                <strong className="sidecard-value">{employeeSnapshot?.emailSimulator?.inboxCount ?? 0} inbox</strong>
+                <ul className="sidecard-list">
+                  <li>Sent: {employeeSnapshot?.emailSimulator?.sentCount ?? 0}</li>
+                  {(employeeSnapshot?.emailSimulator?.pendingSubjects ?? []).map((subject) => (
+                    <li key={subject}>{subject}</li>
+                  ))}
+                  {!employeeSnapshot?.emailSimulator?.pendingSubjects?.length ? <li>No pending email subjects</li> : null}
+                </ul>
+              </article>
+
+              <article className="dashboard-sidecard">
+                <p className="sidecard-label">Missing Staff</p>
+                <strong className="sidecard-value">Status unknown</strong>
+                <ul className="sidecard-list">
+                  {unavailableRoster.map((name) => (
+                    <li key={name}>{name}</li>
+                  ))}
+                </ul>
+              </article>
+            </div>
+
             {staffDossiers.map((entry) => (
               <article className="dossier-card" key={entry.id}>
                 <div className="dossier-head">
@@ -1901,12 +2533,71 @@ export default function App() {
                   <span className="dossier-status">{entry.status}</span>
                 </div>
                 <p className="dossier-location">Current location: {entry.location}</p>
+                <p className="dossier-objective">{entry.objective}</p>
+                {entry.currentAction ? <p className="dossier-current-action">Current action: {entry.currentAction}</p> : null}
                 <p className="dossier-bio">{entry.bio}</p>
+                <div className="dossier-meta-row">
+                  <span>Inbound: {entry.inboundRequests.length}</span>
+                  <span>Outbound: {entry.outboundRequests.length}</span>
+                  <span>Passive memory: {entry.passiveMemoryCount}</span>
+                  <span>Desk notes: {entry.privateNoteCount ?? 0}</span>
+                </div>
+                {entry.currentEmailSubject ? <p className="dossier-current-action">Email: {entry.currentEmailSubject}</p> : null}
                 <ul className="dossier-list">
                   {entry.checklist.map((item) => (
                     <li key={item}>{item}</li>
                   ))}
                 </ul>
+                {entry.inboundRequests.length > 0 || entry.outboundRequests.length > 0 ? (
+                  <div className="dossier-request-groups">
+                    {entry.inboundRequests.length > 0 ? (
+                      <div className="request-group">
+                        <p className="request-group-label">Inbound Requests</p>
+                        <ul className="request-list">
+                          {entry.inboundRequests.map((request) => (
+                            <li key={request.id}>
+                              <span>{request.title}</span>
+                              <span>
+                                {requestStatusLabel(request.status)} · {request.counterpartName}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : null}
+                    {entry.outboundRequests.length > 0 ? (
+                      <div className="request-group">
+                        <p className="request-group-label">Outbound Requests</p>
+                        <ul className="request-list">
+                          {entry.outboundRequests.map((request) => (
+                            <li key={request.id}>
+                              <span>{request.title}</span>
+                              <span>
+                                {requestStatusLabel(request.status)} · {request.counterpartName}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
+                {entry.activeMemory.length > 0 ? (
+                  <div className="memory-group">
+                    <p className="request-group-label">Active Memory</p>
+                    <ul className="memory-list">
+                      {entry.activeMemory.slice(-3).map((memory) => (
+                        <li key={memory.id}>{memory.summary}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+                {entry.performance ? (
+                  <p className="dossier-performance">
+                    Quality {entry.performance.qualityScore.toFixed(2)} · Plans {entry.performance.completedPlans} · Corrections {entry.performance.corrections} · Escalations{' '}
+                    {entry.performance.escalations}
+                  </p>
+                ) : null}
               </article>
             ))}
           </div>
@@ -1914,67 +2605,65 @@ export default function App() {
       ) : null}
 
       <section className={`office-stage ${view === 'dashboard' ? 'is-hidden' : 'is-fullscreen'}`}>
-        <img alt="Office map" className="office-map" draggable={false} src={officeMap} />
+        <div className="office-frame">
+          <img alt="Office map" className="office-map" draggable={false} src={officeMap} />
 
-        {shouldShowGrid || shouldShowLocationEditor ? (
-          <div className="grid-overlay">
-            {gridCells.map((cell) => {
-              const isWalkable = navigation.walkable[cell.index] === 1;
-              const isSelected = selectedGridCellSet.has(cell.index);
-              const isLocationCell = shouldShowLocationEditor && selectedLocation ? exactCellIndexForPoint(navigation, selectedLocation.marker) === cell.index : false;
+          {shouldShowGrid ? (
+            <div className="grid-overlay" onPointerMove={handleGridOverlayPointerMove} ref={gridOverlayRef}>
+              {gridCells.map((cell) => {
+                const isWalkable = navigation.walkable[cell.index] === 1;
+                const isSelected = selectedCellIndex === cell.index;
+                const isLocationCell = selectedLocation ? exactCellIndexForPoint(navigation, selectedLocation.marker) === cell.index : false;
+                const isEntranceCell = entranceIndex === cell.index;
+                const isExitCell = exitIndex === cell.index;
 
-              return (
-                <button
-                  className={`grid-cell ${isWalkable ? 'is-walkable' : 'is-blocked'} ${isSelected ? 'is-selected' : ''} ${isLocationCell ? 'is-location-target' : ''} ${shouldShowLocationEditor ? 'is-location-mode' : ''}`}
-                  key={cell.index}
-                  onPointerDown={() => {
-                    if (shouldShowLocationEditor) {
-                      placeSelectedLocation(cell.index);
-                      return;
-                    }
+                return (
+                  <button
+                    className={`grid-cell ${isWalkable ? 'is-walkable' : 'is-blocked'} ${isSelected ? 'is-selected' : ''} ${isLocationCell ? 'is-location-target' : ''} ${isEntranceCell ? 'is-entrance' : ''} ${isExitCell ? 'is-exit' : ''}`}
+                    key={cell.index}
+                    onPointerDown={() => handleGridCellPointerDown(cell.index)}
+                    onPointerEnter={() => handleGridCellPointerEnter(cell.index)}
+                    style={cell.style}
+                    type="button"
+                  />
+                );
+              })}
+            </div>
+          ) : null}
 
-                    beginGridSelection(cell.index);
-                  }}
-                  onPointerEnter={() => {
-                    if (shouldShowLocationEditor) {
-                      return;
-                    }
+          {shouldShowGrid ? (
+            <div className="location-reveal-layer">
+              {locations.map((location) => {
+                const cellIndex = exactCellIndexForPoint(navigation, location.marker);
+                const cell = gridCells[cellIndex];
+                if (!cell) {
+                  return null;
+                }
 
-                    if (gridSelectionMode) {
-                      updateGridSelection(cell.index, gridSelectionMode);
-                    }
-                  }}
-                  style={cell.style}
-                  type="button"
-                />
-              );
-            })}
-          </div>
-        ) : null}
-
-        {(shouldShowGrid || shouldShowLocationEditor) && revealLocations ? (
-          <div className="location-reveal-layer">
-            {visibleLocations.map((location) => {
-              const cellIndex = exactCellIndexForPoint(navigation, location.marker);
-              const cell = gridCells[cellIndex];
-              if (!cell) {
-                return null;
-              }
-
-              return (
-                <div
-                  className={`location-reveal-chip ${location.id === selectedLocationId ? 'is-active' : ''}`}
-                  key={location.id}
-                  style={actorStyle(cell.centerX, cell.centerY, 1)}
-                >
-                  {location.label}
+                return (
+                  <div
+                    className={`location-reveal-chip ${location.id === selectedLocationId ? 'is-active' : ''}`}
+                    key={location.id}
+                    style={actorStyle(cell.centerX, cell.centerY, 1)}
+                  >
+                    {location.label}
+                  </div>
+                );
+              })}
+              {entranceCell ? (
+                <div className="location-reveal-chip is-door is-entrance" style={actorStyle(entranceCell.centerX, entranceCell.centerY, 1)}>
+                  Entrance
                 </div>
-              );
-            })}
-          </div>
-        ) : null}
+              ) : null}
+              {exitCell ? (
+                <div className="location-reveal-chip is-door is-exit" style={actorStyle(exitCell.centerX, exitCell.centerY, 1)}>
+                  Exit
+                </div>
+              ) : null}
+            </div>
+          ) : null}
 
-        {fixedStaffProfiles.map((staff) => {
+          {fixedStaffProfiles.map((staff) => {
           const location = locationById(staff.locationId, locations);
           if (!location) {
             return null;
@@ -1982,9 +2671,10 @@ export default function App() {
 
           const backendEmployee = employeeById(employeeSnapshot, staff.id);
           const mover = staffTest.movers[staff.id];
-          const x = staffTest.testing && mover ? mover.x : location.marker.x;
-          const y = staffTest.testing && mover ? mover.y : location.marker.y;
-          const frameIndex = staffTest.testing && mover ? mover.frameIndex : fixedStaffFrame(staff.direction, world.tick, staff.animationOffset);
+          const offset = crowdOffsetsByEntity.get(staff.id) ?? { x: 0, y: 0 };
+          const x = (mover?.x ?? location.marker.x) + offset.x;
+          const y = (mover?.y ?? location.marker.y) + offset.y;
+          const frameIndex = mover?.frameIndex ?? fixedStaffFrame(staff.direction, world.tick, staff.animationOffset);
           const placement = thoughtPlacement(x);
           const isExpanded = selectedStaffId === staff.id;
 
@@ -2013,22 +2703,28 @@ export default function App() {
               </button>
             </div>
           );
-        })}
+          })}
 
-        {actorIds.map((actorId) => {
-          const actor = world.actors[actorId];
-          const profile = actorProfiles[actorId];
+          {actorIds.map((actorId) => {
+            const actor = world.actors[actorId];
+            const profile = actorProfiles[actorId];
+            const offset = crowdOffsetsByEntity.get(actorId) ?? { x: 0, y: 0 };
 
-          return (
-            <div
-              className="office-actor"
-              key={actorId}
-              style={{ ...actorStyle(actor.x, actor.y, SPRITE_SIZE), opacity: shouldShowGrid ? 0.38 : 1, pointerEvents: shouldShowGrid ? 'none' : 'auto' }}
-            >
-              <div className="pixel-sprite office-sprite" style={getSpriteStyle(profile.strip, actor.frameIndex)} />
-            </div>
-          );
-        })}
+            return (
+              <div
+                className="office-actor"
+                key={actorId}
+                style={{
+                  ...actorStyle(actor.x + offset.x, actor.y + offset.y, SPRITE_SIZE),
+                  opacity: shouldShowGrid ? 0.38 : 1,
+                  pointerEvents: shouldShowGrid ? 'none' : 'auto',
+                }}
+              >
+                <div className="pixel-sprite office-sprite" style={getSpriteStyle(profile.strip, actor.frameIndex)} />
+              </div>
+            );
+          })}
+        </div>
       </section>
     </main>
   );

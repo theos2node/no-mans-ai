@@ -1,32 +1,29 @@
 # No Man's AI
 
-Pixel-office simulation prototype with a full-screen map, animated staff, a dashboard view, and a visual settings panel for editing the active routing grid and location anchors.
+Office simulation sandbox for testing LLM-directed workers inside a shared pixel office. The current build couples a React control surface, a Node simulation engine, local Ollama/OpenAI-compatible planning, and an Obsidian-style vault that stores shared knowledge, playbook proposals, and per-agent logs.
 
-## Current App
+## Current State
 
-- full-screen office view with animated characters
-- dashboard view with profile cards and live status text
-- runtime controls for `Run`, `Pause`, `Test`, and `Live` / `Not live`
-- backend simulation engine for employee task state, phase progression, and route assignment
-- OpenAI-compatible proxy support via `OPENAI_BASE_URL`
-- live usage tracking for request count, tokens, and estimated cost
-- settings panel with:
-  - live grid overlay
-  - copy/apply grid selection
-  - reveal locations
-  - manual location placement on exact cells
+- interactive office map with animated movement, route playback, crowd-aware sprite offsets, and editable layout anchors
+- dashboard view with live employee state, request queues, model usage, and runtime controls
+- backend workflow engine for planning, approvals, peer requests, inbox handling, and office task execution
+- local LLM support through an OpenAI-compatible endpoint or Ollama native structured output
+- single-flight planner queue with request gap, retry backoff, and circuit-breaker cooling so local models are not overloaded
+- vault-backed archive under `the archives/No man's AI` for shared knowledge, playbook proposals, and agent logs
+- current testing roster is reduced to Sam and Jeremy so a local model can be exercised without the full office generating excessive traffic
 
 ## Main Files
 
 ```text
 src/App.tsx
-src/main.tsx
 src/styles.css
 src/officeNavigation.ts
-src/default-grid-selection.json
-src/default-location-selection.json
+src/default-layout.json
 src/api/server.ts
 src/api/simulationEngine.ts
+src/api/obsidianVault.ts
+scripts/run-local-openai-proxy.sh
+the archives/No man's AI/
 ```
 
 ## Run
@@ -37,29 +34,39 @@ npm run api
 npm run dev
 ```
 
-Then open [http://localhost:5173](http://localhost:5173).
+Open [http://localhost:5173](http://localhost:5173).
 
 The API server runs on [http://localhost:8787](http://localhost:8787).
 
-## Live Proxy Config
+## Live Planner Config
 
-Use these env vars for live planning:
+Use these env vars for local or remote live planning:
 
 ```bash
-OPENAI_API_KEY=...
-OPENAI_BASE_URL=...
-OPENAI_MODEL=gpt-5-nano
+OPENAI_API_KEY=ollama
+OPENAI_BASE_URL=http://127.0.0.1:11435/v1
+OPENAI_MODEL=gemma4:e4b
+PLANNER_REQUEST_TIMEOUT_MS=120000
+PLANNER_MIN_REQUEST_GAP_MS=1500
+PLANNER_RETRY_BACKOFF_MS=20000
 OPENAI_INPUT_COST_PER_1M=
 OPENAI_OUTPUT_COST_PER_1M=
 ```
 
 Notes:
 
-- `OPENAI_BASE_URL` can point to an OpenAI-compatible proxy such as GPT2api.
-- If `OPENAI_MODEL` is unset, the backend also checks `TEST_LAN_PROXY_MODEL` as a local fallback.
-- `Run` uses the live planner when those env vars are set.
-- `Test` stays local and scripted so you can verify movement without spending tokens.
-- Estimated cost uses model defaults when known and can be overridden with the `OPENAI_*_COST_PER_1M` vars.
+- `OPENAI_BASE_URL` can point at an OpenAI-compatible proxy or the local Ollama tunnel.
+- `Run` uses the live planner; `Test` is still useful for verifying movement and UI behavior without spending model calls.
+- The planner queue is serialized, throttled, and backed off after failures so a local server is not hit concurrently or in a tight retry loop.
+- Structured output support is used when talking to Ollama natively so plans come back as machine-readable JSON instead of prompt-shaped free text.
+
+## Vault Layout
+
+The Obsidian-style vault lives in `the archives/No man's AI` and currently stores:
+
+- `Agent Logs/` for per-agent chronological activity logs
+- `Knowledge Base/Shared Knowledge/` for archived outcomes and shared office context
+- `Playbook/Proposals/` for candidate workflows discovered during repeated runs
 
 ## API
 
@@ -76,6 +83,5 @@ Notes:
 
 ## Notes
 
-- The office UI is the active product surface in this repo.
-- The old Riverside Pottery Studio simulation scaffold has been removed.
-- The API layer now owns employee task logic and uses the frontend primarily for route playback and position sync.
+- The frontend is the operator surface; the backend owns planning, task progression, and persistence into the vault.
+- This repository is actively evolving toward stronger agent memory and less repetitive office behavior.

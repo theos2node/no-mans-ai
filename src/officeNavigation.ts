@@ -1,5 +1,4 @@
 import defaultGridSelection from './default-grid-selection.json';
-import defaultLocationSelection from './default-location-selection.json';
 
 export type ActorId = 'sam' | 'jeremy';
 export type Direction = 'down' | 'up' | 'left' | 'right';
@@ -23,6 +22,20 @@ export interface NavigationGrid {
   walkable: Uint8Array;
 }
 
+export interface GridColumnCoordinate {
+  col: number;
+  startX: number;
+  endX: number;
+  centerX: number;
+}
+
+export interface GridCellBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 interface DefaultGridSelectionCell {
   index: number;
   col: number;
@@ -31,14 +44,6 @@ interface DefaultGridSelectionCell {
 }
 
 interface DefaultGridSelection {
-  version: number;
-  mapWidth: number;
-  mapHeight: number;
-  cellSize: number;
-  selectedCells: DefaultGridSelectionCell[];
-}
-
-interface FixedLocationSelection {
   version: number;
   mapWidth: number;
   mapHeight: number;
@@ -59,10 +64,17 @@ const neighborOffsets = [
   { dc: -1, dr: 0 },
 ] as const;
 
-function pointFromCell(col: number, row: number): Point {
+const locationIdAliases: Partial<Record<string, string[]>> = {
+  'customer-service': ['customer-relations'],
+  'quality-inspector': ['quality-assurance'],
+  accounting: ['coordinator'],
+};
+
+function pointFromCell(grid: NavigationGrid, col: number, row: number): Point {
+  const { x, y, width, height } = cellBoundsForCoords(grid, col, row);
   return {
-    x: col * CELL_SIZE + CELL_SIZE / 2,
-    y: row * CELL_SIZE + CELL_SIZE / 2,
+    x: x + width / 2,
+    y: y + height / 2,
   };
 }
 
@@ -97,10 +109,10 @@ export const officeLocations: OfficeLocation[] = [
   {
     id: 'react-c',
     label: 'React C',
-    marker: { x: 1282, y: 542 },
+    marker: { x: 1358, y: 546 },
     targets: {
-      sam: { x: 1282, y: 542 },
-      jeremy: { x: 1282, y: 542 },
+      sam: { x: 1358, y: 546 },
+      jeremy: { x: 1358, y: 546 },
     },
   },
   {
@@ -113,21 +125,30 @@ export const officeLocations: OfficeLocation[] = [
     },
   },
   {
-    id: 'customer-service',
-    label: 'Customer Service',
-    marker: { x: 3220, y: 906 },
+    id: 'customer-relations',
+    label: 'Customer Relations',
+    marker: { x: 2226, y: 1078 },
     targets: {
-      sam: { x: 3220, y: 906 },
-      jeremy: { x: 3220, y: 906 },
+      sam: { x: 2226, y: 1078 },
+      jeremy: { x: 2226, y: 1078 },
     },
   },
   {
-    id: 'accounting',
-    label: 'Accounting',
-    marker: { x: 3254, y: 178 },
+    id: 'war-room',
+    label: 'War Room',
+    marker: { x: 3402, y: 966 },
     targets: {
-      sam: { x: 3254, y: 178 },
-      jeremy: { x: 3254, y: 178 },
+      sam: { x: 3374, y: 966 },
+      jeremy: { x: 3402, y: 966 },
+    },
+  },
+  {
+    id: 'coordinator',
+    label: 'Coordinator',
+    marker: { x: 2506, y: 742 },
+    targets: {
+      sam: { x: 2506, y: 742 },
+      jeremy: { x: 2506, y: 742 },
     },
   },
   {
@@ -158,12 +179,12 @@ export const officeLocations: OfficeLocation[] = [
     },
   },
   {
-    id: 'quality-inspector',
-    label: 'Quality Inspector',
-    marker: { x: 1736, y: 374 },
+    id: 'quality-assurance',
+    label: 'Quality Assurance',
+    marker: { x: 2422, y: 1078 },
     targets: {
-      sam: { x: 1736, y: 374 },
-      jeremy: { x: 1736, y: 374 },
+      sam: { x: 2422, y: 1078 },
+      jeremy: { x: 2422, y: 1078 },
     },
   },
   {
@@ -245,35 +266,30 @@ function squaredDistance(a: Point, b: Point) {
   return dx * dx + dy * dy;
 }
 
-function getFixedLocationAnchors(grid: NavigationGrid) {
-  const selection = defaultLocationSelection as FixedLocationSelection;
-  const canUseSelection =
-    selection &&
-    selection.mapWidth === MAP_WIDTH &&
-    selection.mapHeight === MAP_HEIGHT &&
-    selection.cellSize === CELL_SIZE &&
-    Array.isArray(selection.selectedCells) &&
-    selection.selectedCells.length > 0;
-
-  if (!canUseSelection) {
-    return [];
-  }
-
-  return selection.selectedCells.map((cell) => ({
-    index: cell.index,
-    point: cellCenter(grid, cell.index),
-  }));
+function cellBoundsForCoords(grid: NavigationGrid, col: number, row: number): GridCellBounds {
+  const x = col * grid.cellSize;
+  const y = row * grid.cellSize;
+  return {
+    x,
+    y,
+    width: Math.min(grid.cellSize, MAP_WIDTH - x),
+    height: Math.min(grid.cellSize, MAP_HEIGHT - y),
+  };
 }
 
-export function buildNavigationGrid(): NavigationGrid {
+export function createEmptyNavigationGrid(): NavigationGrid {
   const cols = Math.ceil(MAP_WIDTH / CELL_SIZE);
   const rows = Math.ceil(MAP_HEIGHT / CELL_SIZE);
-  const grid: NavigationGrid = {
+  return {
     cols,
     rows,
     cellSize: CELL_SIZE,
     walkable: new Uint8Array(cols * rows),
   };
+}
+
+export function buildNavigationGrid(): NavigationGrid {
+  const grid = createEmptyNavigationGrid();
 
   const selection = defaultGridSelection as DefaultGridSelection;
   const canUseSelectionAsDefault =
@@ -304,7 +320,32 @@ export function cellCenter(grid: NavigationGrid, index: number): Point {
   const col = index % grid.cols;
   const row = Math.floor(index / grid.cols);
 
-  return pointFromCell(col, row);
+  return pointFromCell(grid, col, row);
+}
+
+export function cellBounds(grid: NavigationGrid, index: number): GridCellBounds {
+  const col = index % grid.cols;
+  const row = Math.floor(index / grid.cols);
+  return cellBoundsForCoords(grid, col, row);
+}
+
+export function buildGridColumns(grid: NavigationGrid): GridColumnCoordinate[] {
+  return Array.from({ length: grid.cols }, (_, col) => {
+    const startX = col * grid.cellSize;
+    const endX = Math.min(MAP_WIDTH, startX + grid.cellSize);
+    return {
+      col,
+      startX,
+      endX,
+      centerX: startX + (endX - startX) / 2,
+    };
+  });
+}
+
+export function gridIndexForPoint(grid: NavigationGrid, point: Point) {
+  const col = Math.max(0, Math.min(grid.cols - 1, Math.floor(point.x / grid.cellSize)));
+  const row = Math.max(0, Math.min(grid.rows - 1, Math.floor(point.y / grid.cellSize)));
+  return row * grid.cols + col;
 }
 
 export function isWalkableIndex(grid: NavigationGrid, index: number) {
@@ -312,9 +353,9 @@ export function isWalkableIndex(grid: NavigationGrid, index: number) {
 }
 
 export function closestWalkableIndex(grid: NavigationGrid, point: Point) {
-  const desiredCol = Math.max(0, Math.min(grid.cols - 1, Math.floor(point.x / grid.cellSize)));
-  const desiredRow = Math.max(0, Math.min(grid.rows - 1, Math.floor(point.y / grid.cellSize)));
-  const desiredIndex = cellIndex(grid, desiredCol, desiredRow);
+  const desiredIndex = gridIndexForPoint(grid, point);
+  const desiredCol = desiredIndex % grid.cols;
+  const desiredRow = Math.floor(desiredIndex / grid.cols);
 
   if (isWalkableIndex(grid, desiredIndex)) {
     return desiredIndex;
@@ -372,30 +413,10 @@ export function snapPointToWalkable(grid: NavigationGrid, point: Point) {
 }
 
 export function normalizeOfficeLocations(grid: NavigationGrid, locations: OfficeLocation[]) {
-  const anchors = getFixedLocationAnchors(grid);
-  const remainingAnchors = [...anchors];
-
   return locations.map((location) => {
-    let marker = snapPointToWalkable(grid, location.marker);
-
-    if (remainingAnchors.length > 0) {
-      let closestIndex = 0;
-      let closestDistance = squaredDistance(location.marker, remainingAnchors[0].point);
-
-      for (let index = 1; index < remainingAnchors.length; index += 1) {
-        const distance = squaredDistance(location.marker, remainingAnchors[index].point);
-        if (distance < closestDistance) {
-          closestDistance = distance;
-          closestIndex = index;
-        }
-      }
-
-      marker = remainingAnchors.splice(closestIndex, 1)[0].point;
-    }
-
     return {
       ...location,
-      marker,
+      marker: snapPointToWalkable(grid, location.marker),
       targets: {
         sam: snapPointToWalkable(grid, location.targets.sam),
         jeremy: snapPointToWalkable(grid, location.targets.jeremy),
@@ -524,5 +545,11 @@ export function directionBetween(grid: NavigationGrid, from: number, to: number)
 }
 
 export function locationById(locationId: string, locations: OfficeLocation[] = officeLocations) {
-  return locations.find((location) => location.id === locationId) ?? null;
+  const direct = locations.find((location) => location.id === locationId);
+  if (direct) {
+    return direct;
+  }
+
+  const aliases = locationIdAliases[locationId] ?? [];
+  return locations.find((location) => aliases.includes(location.id)) ?? null;
 }

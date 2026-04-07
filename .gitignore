@@ -3,8 +3,10 @@ dist/
 .env
 .claude/
 tmp/
+.proxy-venv/
 data/memory/
 data/logs/
+data/office-runtime.json
 *.js
 *.js.map
 *.d.ts
