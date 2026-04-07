@@ -4,8 +4,9 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import {
   createObsidianVault,
   type VaultEmail,
+  type VaultAgentLiveMemory,
+  type VaultAgentMemorySummary,
   type VaultKnowledgeSummary,
-  type VaultPrivateNoteSummary,
 } from './obsidianVault.ts';
 
 export type RunState = 'idle' | 'running' | 'paused';
@@ -287,7 +288,9 @@ interface EmployeeRuntimeRecord extends EmployeeSeed {
   planning: boolean;
   plannerRequestToken: number;
   plannerRetryAt: number;
-  privateNotes: VaultPrivateNoteSummary[];
+  privateNotes: VaultAgentMemorySummary[];
+  liveMemory: VaultAgentLiveMemory | null;
+  memoryNoteCount: number;
   currentEmail: VaultEmail | null;
   draftedEmailBody: string | null;
   activeMemory: MemoryItem[];
@@ -379,7 +382,7 @@ const PLANNER_MIN_REQUEST_GAP_MS = Number(process.env.PLANNER_MIN_REQUEST_GAP_MS
 const PLANNER_RETRY_BACKOFF_MS = Number(process.env.PLANNER_RETRY_BACKOFF_MS ?? 20_000);
 const PLANNER_CIRCUIT_BREAKER_THRESHOLD = Number(process.env.PLANNER_CIRCUIT_BREAKER_THRESHOLD ?? 8);
 const PLANNER_CIRCUIT_BREAKER_COOLDOWN_MS = Number(process.env.PLANNER_CIRCUIT_BREAKER_COOLDOWN_MS ?? 120_000);
-const ACTIVE_MEMORY_LIMIT = 6;
+const ACTIVE_MEMORY_LIMIT = 4;
 const PASSIVE_MEMORY_LIMIT = 24;
 const MEMORY_CONSOLIDATION_INTERVAL = 12;
 const PERSISTED_STATE_VERSION = 2;
@@ -961,6 +964,8 @@ function createEmployeeState(seed: EmployeeSeed): EmployeeRuntimeRecord {
     plannerRequestToken: 0,
     plannerRetryAt: 0,
     privateNotes: [],
+    liveMemory: null,
+    memoryNoteCount: 0,
     currentEmail: null,
     draftedEmailBody: null,
     activeMemory: [
@@ -1529,7 +1534,7 @@ function buildRequestHandlingPlan(employee: EmployeeRuntimeRecord, request: Offi
   const requesterName = employeeSeeds.find((seed) => seed.id === request.fromId)?.name ?? request.fromId;
 
   const actions: OfficeAction[] = [
-    buildAction('read_private_notes', employee.assignedLocationId, 'Review private desk notes'),
+    buildAction('read_private_notes', employee.assignedLocationId, 'Refresh personal memory'),
     buildAction('fetch_context', employee.assignedLocationId, `Review ${request.kind.replace('_', ' ')} context`, {
       notes: request.details,
     }),
@@ -1634,7 +1639,7 @@ function defaultPlansFor(seed: EmployeeRuntimeRecord): TaskPlan[] {
             'Implementation Pass',
             `${seed.position} is handling the core React lane while the rest of the office is unavailable.`,
             [
-              buildAction('read_private_notes', seed.assignedLocationId, 'Review private desk notes'),
+              buildAction('read_private_notes', seed.assignedLocationId, 'Refresh personal memory'),
               buildAction('fetch_context', seed.assignedLocationId, 'Pull latest task context'),
               buildAction('desk_work', seed.assignedLocationId, 'Complete front-end work pass'),
               buildAction('read_archives', 'archives', 'Review playbook before locking the implementation path'),
@@ -1695,7 +1700,7 @@ function defaultPlansFor(seed: EmployeeRuntimeRecord): TaskPlan[] {
           'Implementation Pass',
           `${seed.position} is pulling context, shipping a bounded implementation pass, and reporting the result back into the office.`,
           [
-            buildAction('read_private_notes', seed.assignedLocationId, 'Review private desk notes'),
+            buildAction('read_private_notes', seed.assignedLocationId, 'Refresh personal memory'),
             buildAction('fetch_context', seed.assignedLocationId, 'Pull latest task context'),
             buildAction('desk_work', seed.assignedLocationId, 'Complete front-end work pass'),
             buildAction('second_opinion', 'react-a', 'Get a peer read on the implementation pass', {
@@ -1713,7 +1718,7 @@ function defaultPlansFor(seed: EmployeeRuntimeRecord): TaskPlan[] {
           'Cross-Team Investigation',
           `${seed.position} is investigating a user-facing issue, collaborating with the React team, and reporting the findings back into the office.`,
           [
-            buildAction('read_private_notes', seed.assignedLocationId, 'Review private desk notes'),
+            buildAction('read_private_notes', seed.assignedLocationId, 'Refresh personal memory'),
             buildAction('fetch_context', 'customer-relations', 'Review issue intake'),
             buildAction('investigate', seed.assignedLocationId, 'Trace issue through assigned desk'),
             buildAction('second_opinion', 'react-d', 'Get second opinion on fix path', {
@@ -1820,7 +1825,7 @@ function defaultPlansFor(seed: EmployeeRuntimeRecord): TaskPlan[] {
           seed.defaultTaskTitle,
           `${seed.position} is executing a short office run.`,
           [
-            buildAction('read_private_notes', seed.assignedLocationId, 'Review private desk notes'),
+            buildAction('read_private_notes', seed.assignedLocationId, 'Refresh personal memory'),
             buildAction('fetch_context', seed.assignedLocationId, seed.defaultChecklist[0] ?? 'Review work queue'),
             buildAction('desk_work', seed.assignedLocationId, seed.defaultChecklist[1] ?? 'Complete assigned work'),
             buildAction('archive_note', 'archives', seed.defaultChecklist[2] ?? 'Record completion notes'),
@@ -1992,6 +1997,9 @@ export class OfficeSimulationEngine {
     }
     this.refreshVaultContext();
     this.hydratePersistedState();
+    for (const employee of this.employees.values()) {
+      this.syncLiveMemory(employee);
+    }
   }
 
   getRunnerMeta(): RunnerMeta {
@@ -2042,7 +2050,7 @@ export class OfficeSimulationEngine {
         currentAction: currentAction?.label ?? null,
         currentActionType: currentAction?.type ?? null,
         currentEmailSubject: employee.currentEmail?.subject ?? null,
-        privateNoteCount: employee.privateNotes.length,
+        privateNoteCount: employee.memoryNoteCount,
         activeMemory: employee.activeMemory.map(cloneMemoryItem),
         passiveMemoryCount: employee.passiveMemory.length,
         inboundRequests: this.requestSummariesForEmployee(employee.id, 'inbound'),
@@ -2144,6 +2152,7 @@ export class OfficeSimulationEngine {
       employee.phase = 'paused';
       employee.status = `Paused at ${locationLabel(employee.currentLocationId)}`;
       employee.lastUpdatedAt = nowIso();
+      this.syncLiveMemory(employee);
     }
     this.plannerQueue = [];
     this.plannerBusy = false;
@@ -2196,6 +2205,9 @@ export class OfficeSimulationEngine {
       this.employees.set(seed.id, createEmployeeState(seed));
     }
     this.refreshVaultContext();
+    for (const employee of this.employees.values()) {
+      this.syncLiveMemory(employee);
+    }
     this.persistState();
 
     this.pushSystemLog('Simulation reset to the default office roster.');
@@ -2329,8 +2341,81 @@ export class OfficeSimulationEngine {
     this.playbookRules = vaultRules.length > 0 ? vaultRules : defaultPlaybookRules.map((rule) => ({ ...rule }));
     this.knowledgeSummaries = this.vault.loadKnowledgeSummaries();
     for (const employee of this.employees.values()) {
-      employee.privateNotes = this.vault.loadPrivateNoteSummaries(employee.name);
+      this.refreshEmployeeMemoryWorkspace(employee);
     }
+  }
+
+  private buildAgentMemoryQuery(employee: EmployeeRuntimeRecord) {
+    const queryParts = [employee.taskTitle, employee.objective];
+    const pendingRequest = this.nextPendingRequestFor(employee.id);
+    if (pendingRequest) {
+      queryParts.push(pendingRequest.title, pendingRequest.details);
+    }
+    if (employee.currentEmail) {
+      queryParts.push(employee.currentEmail.subject, employee.currentEmail.summary);
+    }
+    return queryParts.filter(Boolean).join(' ');
+  }
+
+  private refreshEmployeeMemoryWorkspace(employee: EmployeeRuntimeRecord) {
+    const query = this.buildAgentMemoryQuery(employee);
+    employee.privateNotes = this.vault.searchAgentMemories(employee.name, query, 5);
+    employee.liveMemory = this.vault.loadAgentLiveMemory(employee.name);
+    employee.memoryNoteCount = this.vault.countAgentMemories(employee.name);
+  }
+
+  private syncLiveMemory(employee: EmployeeRuntimeRecord) {
+    const checklist = serializeChecklist(employee.currentPlan).slice(0, 5);
+    const openLoops = [
+      ...this.requestSummariesForEmployee(employee.id, 'inbound').map(
+        (request) => `${request.kind}: ${request.title} from ${request.counterpartName} (${request.status})`,
+      ),
+      ...this.requestSummariesForEmployee(employee.id, 'outbound').map(
+        (request) => `${request.kind}: ${request.title} for ${request.counterpartName} (${request.status})`,
+      ),
+      ...(employee.currentEmail ? [`Email: ${employee.currentEmail.subject} from ${employee.currentEmail.from}`] : []),
+    ].slice(0, 4);
+    const recentContext = employee.activeMemory.slice(-2).map((item) => item.summary);
+
+    this.vault.writeAgentLiveMemory({
+      employeeName: employee.name,
+      status: employee.phase,
+      focus: employee.currentPlan ? employee.taskTitle : 'Awaiting the next concrete task.',
+      objective: employee.currentPlan ? employee.objective : 'No active plan. Check priorities, pending requests, or ask leadership for the next useful initiative.',
+      checklist,
+      openLoops,
+      recentContext,
+    });
+    this.refreshEmployeeMemoryWorkspace(employee);
+  }
+
+  private storeLongTermMemory(
+    employee: EmployeeRuntimeRecord,
+    entry: {
+      title: string;
+      summary: string;
+      details: string;
+      kind: MemoryKind | 'note';
+      tags?: string[];
+      importance?: number;
+      referenceId?: string | null;
+      relatedEmployeeId?: EmployeeId | null;
+      relatedLocationId?: OfficeLocationId | null;
+    },
+  ) {
+    this.vault.appendAgentMemory({
+      employeeName: employee.name,
+      title: entry.title,
+      summary: entry.summary,
+      details: entry.details,
+      kind: entry.kind,
+      tags: entry.tags,
+      importance: entry.importance,
+      referenceId: entry.referenceId,
+      relatedLocationId: entry.relatedLocationId,
+      relatedEmployeeName: entry.relatedEmployeeId ? this.employees.get(entry.relatedEmployeeId)?.name ?? entry.relatedEmployeeId : null,
+    });
+    this.refreshEmployeeMemoryWorkspace(employee);
   }
 
   private logAgentEvent(employee: EmployeeRuntimeRecord, heading: string, body: string) {
@@ -2343,18 +2428,35 @@ export class OfficeSimulationEngine {
 
   private archiveKnowledge(employee: EmployeeRuntimeRecord, action: OfficeAction) {
     const plan = employee.currentPlan;
+    const checklistState = plan ? serializeChecklist(plan).map((item) => `- ${item}`).join('\n') : '';
     this.vault.appendSharedKnowledge({
       title: `${employee.position} ${employee.taskTitle}`,
       summary: `${employee.name} archived a completed office action from ${locationLabel(action.locationId)}.`,
       details: [
         `Objective: ${employee.objective}`,
         `Current action: ${action.label}`,
-        plan ? `Checklist state:\n${serializeChecklist(plan).map((item) => `- ${item}`).join('\n')}` : '',
+        plan ? `Checklist state:\n${checklistState}` : '',
       ]
         .filter(Boolean)
         .join('\n\n'),
       sourceEmployee: employee.name,
       tags: [employee.department, 'archive', slugify(employee.taskTitle)],
+    });
+    this.storeLongTermMemory(employee, {
+      title: employee.taskTitle,
+      summary: `Archived a completed task at ${locationLabel(action.locationId)}.`,
+      details: [
+        `Objective: ${employee.objective}`,
+        `Current action: ${action.label}`,
+        checklistState ? `Checklist state:\n${checklistState}` : '',
+      ]
+        .filter(Boolean)
+        .join('\n\n'),
+      kind: 'task',
+      tags: [employee.department, 'archive', slugify(employee.taskTitle)],
+      importance: 3,
+      referenceId: employee.currentPlan?.id ?? null,
+      relatedLocationId: action.locationId,
     });
     this.refreshVaultContext();
     if (/temporary office coverage protocol|temporary task board update/i.test(action.label)) {
@@ -2371,6 +2473,7 @@ export class OfficeSimulationEngine {
       'Archive Note',
       `Archived shared knowledge for "${employee.taskTitle}" at ${locationLabel(action.locationId)}.`,
     );
+    this.syncLiveMemory(employee);
   }
 
   private maybeProposePlaybookPattern(employee: EmployeeRuntimeRecord, title: string) {
@@ -2437,18 +2540,26 @@ export class OfficeSimulationEngine {
   }
 
   private readPrivateDeskNotes(employee: EmployeeRuntimeRecord) {
-    employee.privateNotes = this.vault.loadPrivateNoteSummaries(employee.name);
-    if (employee.privateNotes.length === 0) {
-      this.logAgentEvent(employee, 'Desk Folder Checked', 'Private desk folder is available but currently empty.');
-      return;
-    }
-
+    this.refreshEmployeeMemoryWorkspace(employee);
+    const liveMemory = employee.liveMemory;
     const noteList = employee.privateNotes.slice(0, 3).map((note) => `- ${note.title}: ${note.summary}`).join('\n');
-    this.addMemory(employee.id, 'context', `${employee.name} reviewed private desk notes.`, {
+    const liveMemoryBody = [
+      `Focus: ${liveMemory?.focus ?? 'Awaiting the next concrete task.'}`,
+      `Objective: ${liveMemory?.objective ?? 'No active plan.'}`,
+      `Checklist: ${(liveMemory?.checklist ?? []).join(' | ') || 'none'}`,
+      `Open loops: ${(liveMemory?.openLoops ?? []).join(' | ') || 'none'}`,
+    ].join('\n');
+
+    this.addMemory(employee.id, 'context', `${employee.name} refreshed personal memory and recalled prior notes.`, {
       relatedLocationId: employee.assignedLocationId,
       importance: 2,
     });
-    this.logAgentEvent(employee, 'Desk Folder Checked', `Loaded private desk notes:\n${noteList}`);
+    this.logAgentEvent(
+      employee,
+      'Memory Workspace Checked',
+      `${liveMemoryBody}\n\nRecalled long-term memory:\n${noteList || '- none'}`,
+    );
+    this.syncLiveMemory(employee);
   }
 
   private readArchiveMaterials(employee: EmployeeRuntimeRecord) {
@@ -2464,6 +2575,7 @@ export class OfficeSimulationEngine {
       'Archives Consulted',
       `Playbook:\n${playbookList || '- none'}\n\nShared knowledge:\n${knowledgeList || '- none'}`,
     );
+    this.syncLiveMemory(employee);
   }
 
   private reviewInboxEmail(employee: EmployeeRuntimeRecord, action: OfficeAction) {
@@ -2485,6 +2597,7 @@ export class OfficeSimulationEngine {
       'Inbox Email Reviewed',
       `Subject: ${email.subject}\nFrom: ${email.from}\nTo: ${email.to}\n\n${email.body}`,
     );
+    this.syncLiveMemory(employee);
   }
 
   private composeEmailDraft(employee: EmployeeRuntimeRecord, email: VaultEmail) {
@@ -2546,6 +2659,7 @@ export class OfficeSimulationEngine {
     });
     this.refreshVaultContext();
     this.logAgentEvent(employee, 'Email Drafted', `Drafted email reply for "${email.subject}".`);
+    this.syncLiveMemory(employee);
   }
 
   private sendEmail(employee: EmployeeRuntimeRecord) {
@@ -2570,6 +2684,7 @@ export class OfficeSimulationEngine {
     employee.currentEmail = null;
     this.persistState();
     this.logAgentEvent(employee, 'Email Sent', `Sent reply for "${email.subject}" to ${email.from}.`);
+    this.syncLiveMemory(employee);
   }
 
   private enqueueLivePlan(employeeId: EmployeeId) {
@@ -3082,7 +3197,22 @@ export class OfficeSimulationEngine {
       'Request Created',
       `Opened a ${request.kind} request titled "${request.title}" for ${counterpart?.name ?? counterpartId} at ${locationLabel(request.locationId)}.\n\n${request.details}`,
     );
+    this.storeLongTermMemory(employee, {
+      title: `${request.title} request`,
+      summary: `Asked ${counterpart?.name ?? counterpartId} for ${request.kind}.`,
+      details: `Request type: ${request.kind}\nCounterpart: ${counterpart?.name ?? counterpartId}\nLocation: ${locationLabel(request.locationId)}\n\n${request.details}`,
+      kind: request.kind === 'approval' ? 'approval' : 'review',
+      tags: [request.kind, 'request', slugify(request.title)],
+      importance: 2,
+      referenceId: request.id,
+      relatedEmployeeId: counterpartId,
+      relatedLocationId: request.locationId,
+    });
     this.pushSystemLog(`${employee.name} requested ${request.kind} from ${counterpart?.name ?? counterpartId}.`);
+    this.syncLiveMemory(employee);
+    if (counterpart) {
+      this.syncLiveMemory(counterpart);
+    }
   }
 
   private resolveRequestForEmployee(employee: EmployeeRuntimeRecord, action: OfficeAction) {
@@ -3148,9 +3278,25 @@ export class OfficeSimulationEngine {
       decision.approved ? 'Request Approved' : 'Request Rejected',
       `${decision.summary}\n\nRequest: ${request.title}\nFrom: ${requester?.name ?? request.fromId}`,
     );
+    this.storeLongTermMemory(employee, {
+      title: `${request.title} decision`,
+      summary: decision.summary,
+      details: `Outcome: ${decision.approved ? 'approved' : 'rejected'}\nRequest: ${request.title}\nFrom: ${requester?.name ?? request.fromId}\nKind: ${request.kind}`,
+      kind: decision.approved ? 'review' : 'correction',
+      tags: [request.kind, decision.approved ? 'approved' : 'rejected', slugify(request.title)],
+      importance: decision.approved ? 2 : 3,
+      referenceId: request.id,
+      relatedEmployeeId: request.fromId,
+      relatedLocationId: request.locationId,
+    });
 
     if (!decision.approved && request.kind === 'approval' && REDUCED_ROSTER_TEST_MODE) {
       this.createTerminalItem(employee.id, 'Owner review required', decision.summary, 'high', 'red-terminal');
+    }
+
+    this.syncLiveMemory(employee);
+    if (requester) {
+      this.syncLiveMemory(requester);
     }
 
     if (!decision.approved && requester && request.kind === 'approval') {
@@ -3240,7 +3386,17 @@ export class OfficeSimulationEngine {
       relatedLocationId: action.locationId,
       importance: 3,
     });
+    this.storeLongTermMemory(employee, {
+      title: action.label,
+      summary: `Escalated to the Red Terminal from ${locationLabel(action.locationId)}.`,
+      details: action.notes ?? `${employee.name} escalated an office issue that needed owner judgment.`,
+      kind: 'escalation',
+      tags: ['terminal', 'escalation', slugify(action.label)],
+      importance: 3,
+      relatedLocationId: action.locationId,
+    });
     this.pushSystemLog(`${employee.name} escalated "${action.label}" to the Red Terminal.`);
+    this.syncLiveMemory(employee);
     this.advanceToNextAction(employee);
   }
 
@@ -3388,6 +3544,7 @@ export class OfficeSimulationEngine {
       scripted ? 'Scripted Plan Started' : 'Plan Started',
       `Objective: ${guardedPlan.objective}\n\nChecklist:\n${serializeChecklist(guardedPlan).map((item) => `- ${item}`).join('\n')}`,
     );
+    this.syncLiveMemory(employee);
 
     if (firstAction.locationId === employee.currentLocationId) {
       employee.targetLocationId = null;
@@ -3429,11 +3586,13 @@ export class OfficeSimulationEngine {
 
     const nextAction = plan.actions[nextIndex];
     if (nextAction.locationId !== employee.currentLocationId) {
+      this.syncLiveMemory(employee);
       this.beginMove(employee, nextAction.locationId);
       return;
     }
 
     employee.phase = nextAction.status === 'waiting' ? 'waiting' : 'working';
+    this.syncLiveMemory(employee);
     if (pushStatus) {
       this.refreshStatus(employee);
     }
@@ -3460,11 +3619,27 @@ export class OfficeSimulationEngine {
     if (finishedPlan && finishedPlan.source !== 'test') {
       this.maybeProposePlaybookPattern(employee, finishedTitle);
     }
+    this.storeLongTermMemory(employee, {
+      title: finishedTitle,
+      summary: `Completed at ${locationLabel(employee.currentLocationId)}.`,
+      details: [
+        `Objective: ${employee.objective}`,
+        finishedPlan ? `Final checklist:\n${serializeChecklist(finishedPlan).map((item) => `- ${item}`).join('\n')}` : '',
+      ]
+        .filter(Boolean)
+        .join('\n\n'),
+      kind: 'task',
+      tags: ['plan-complete', slugify(finishedTitle)],
+      importance: 2,
+      referenceId: finishedPlan?.id ?? null,
+      relatedLocationId: employee.currentLocationId,
+    });
     this.logAgentEvent(
       employee,
       'Plan Completed',
       `Completed "${finishedTitle}" at ${locationLabel(employee.currentLocationId)}.${finishedPlan ? `\n\nFinal checklist:\n${serializeChecklist(finishedPlan).map((item) => `- ${item}`).join('\n')}` : ''}`,
     );
+    this.syncLiveMemory(employee);
     this.persistState();
     this.pushSystemLog(`${employee.name} completed ${finishedTitle}.`);
   }
@@ -3929,9 +4104,18 @@ export class OfficeSimulationEngine {
       return classifyInboxEmail(email);
     }
 
+    this.refreshEmployeeMemoryWorkspace(employee);
     const fallback = classifyInboxEmail(email);
     const activeMemory = employee.activeMemory.slice(-4).map((item) => `- ${item.summary}`).join('\n');
-    const privateNotes =
+    const liveMemory = employee.liveMemory
+      ? [
+          `Focus: ${employee.liveMemory.focus}`,
+          `Objective: ${employee.liveMemory.objective}`,
+          `Checklist: ${employee.liveMemory.checklist.join(' | ') || 'none'}`,
+          `Open loops: ${employee.liveMemory.openLoops.join(' | ') || 'none'}`,
+        ].join('\n')
+      : '- none';
+    const personalMemory =
       employee.privateNotes.length > 0 ? employee.privateNotes.slice(0, 5).map((note) => `- ${note.title}: ${note.summary}`).join('\n') : '- none';
     const pendingApprovals = this.requestSummariesForEmployee(employee.id, 'outbound')
       .map((request) => `- ${request.kind}: ${request.title} (${request.status})`)
@@ -3961,7 +4145,8 @@ export class OfficeSimulationEngine {
           `From: ${email.from}`,
           `Summary: ${email.summary}`,
           `Body:\n${email.body}`,
-          `Private desk notes:\n${privateNotes}`,
+          `Live memory:\n${liveMemory}`,
+          `Personal long-term memory:\n${personalMemory}`,
           `Active memory:\n${activeMemory || '- none'}`,
           `Open outbound requests:\n${pendingApprovals || '- none'}`,
           'Pick the smallest useful collaboration pattern that still feels like a competent office.',
@@ -4071,6 +4256,7 @@ export class OfficeSimulationEngine {
       throw new Error('Live planner is not configured.');
     }
 
+    this.refreshEmployeeMemoryWorkspace(employee);
     const pendingRequest = this.nextPendingRequestFor(employee.id);
     const activeMemory = employee.activeMemory.slice(-4).map((item) => `- ${item.summary}`).join('\n');
     const recentTaskSummary = this.recentTaskMemories(employee, 6).map((item) => `- ${item.summary}`).join('\n');
@@ -4084,6 +4270,15 @@ export class OfficeSimulationEngine {
       .slice(0, 3)
       .map((item) => `- ${item.title}: ${item.summary}`)
       .join('\n');
+    const liveMemory =
+      employee.liveMemory
+        ? [
+            `Focus: ${employee.liveMemory.focus}`,
+            `Objective: ${employee.liveMemory.objective}`,
+            `Checklist: ${employee.liveMemory.checklist.join(' | ') || 'none'}`,
+            `Open loops: ${employee.liveMemory.openLoops.join(' | ') || 'none'}`,
+          ].join('\n')
+        : '- none';
     const sharedKnowledge =
       employee.currentLocationId === 'archives'
         ? this.knowledgeSummaries
@@ -4119,7 +4314,7 @@ export class OfficeSimulationEngine {
           'Hierarchy: Red Terminal / owner is the highest authority. General Manager is the only internal approver. Everyone else is on an even playing field.',
           'Quality Assurance is advisory, not supervisory. React A, B, C, and D are a reaction team that can help any office workflow when free.',
           'War Room is a shared collaboration desk for multi-person strategy huddles when employees need to align before reporting back.',
-          'Private desk folders are only accessible at the employee assigned desk. Use read_private_notes there.',
+          'Each agent only has access to their own memory workspace. Personal long-term memory is only accessible at the assigned desk. Use read_private_notes there to refresh live memory and search long-term memory.',
           'The Playbook and shared knowledge are only accessible in Archives. Use read_archives when policy or past precedent matters.',
           REDUCED_ROSTER_TEST_MODE ? REDUCED_ROSTER_NOTE : '',
           REDUCED_ROSTER_TEST_MODE
@@ -4154,7 +4349,8 @@ export class OfficeSimulationEngine {
           `Chain of command: ${REDUCED_ROSTER_TEST_MODE ? 'Sam and Jeremy are temporarily sharing office coverage and may sign off for one another when needed.' : employee.id === primaryCoverageEmployeeId ? 'Red Terminal / owner above General Manager' : `General Manager above ${employee.position}; peers are otherwise equal`}`,
           `Bio: ${employee.bio}`,
           `Default checklist: ${employee.defaultChecklist.join('; ')}`,
-          `Private desk notes:\n${privateNotes || '- unavailable until you are at your assigned desk'}`,
+          `Live memory:\n${liveMemory}`,
+          `Personal long-term memory:\n${privateNotes || '- unavailable until you are at your assigned desk'}`,
           `Playbook rules from Archives:\n${playbookRules || '- unavailable until you are in Archives'}`,
           `Shared knowledge from Archives:\n${sharedKnowledge || '- unavailable until you are in Archives'}`,
           `Active memory:\n${activeMemory || '- none'}`,

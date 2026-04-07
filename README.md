@@ -62,9 +62,12 @@ Notes:
 
 ## Vault Layout
 
-The Obsidian-style vault lives in `the archives/No man's AI` and currently stores:
+The Obsidian-style vault lives in `the archives/No man's AI` and now stores agent memory under per-agent workspaces:
 
-- `Agent Logs/` for per-agent chronological activity logs
+- `Agents/<name>/live-memory.md` for the tiny current-memory snapshot
+- `Agents/<name>/long-term-memory/` for structured searchable memory notes
+- `Agents/<name>/agent-log/` for chronological activity logs
+- `Agents/<name>/legacy-notes/` for migrated older desk-note material
 - `Knowledge Base/Shared Knowledge/` for archived outcomes and shared office context
 - `Playbook/Proposals/` for candidate workflows discovered during repeated runs
 
