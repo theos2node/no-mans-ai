@@ -412,6 +412,11 @@ interface PersistedOfficeState {
   processedEmailIds?: string[];
   requests?: OfficeRequest[];
   officeRecordActivity?: OfficeRecordActivity[];
+  terminalItems?: TerminalItem[];
+  tickCount?: number;
+  usage?: UsageSnapshot;
+  status?: DashboardStatus;
+  logs?: LogEntry[];
 }
 
 const ENGINE_TICK_MS = 800;
@@ -428,8 +433,14 @@ const PLANNER_CIRCUIT_BREAKER_COOLDOWN_MS = Number(process.env.PLANNER_CIRCUIT_B
 const ACTIVE_MEMORY_LIMIT = 4;
 const PASSIVE_MEMORY_LIMIT = 24;
 const MEMORY_CONSOLIDATION_INTERVAL = 12;
-const PERSISTED_STATE_VERSION = 5;
+const RUNTIME_HEARTBEAT_INTERVAL = 15;
+const REFLECTION_COOLDOWN_MS = 45 * 60_000;
+const RECENT_TITLE_WINDOW_MS = 45 * 60_000;
+const RECENT_TITLE_REPEAT_PENALTY = 28;
+const RECENT_TASK_HISTORY_LIMIT = 48;
+const PERSISTED_STATE_VERSION = 6;
 const RUNTIME_STATE_FILE = new URL('../../data/office-runtime.json', import.meta.url);
+const RUNTIME_HEARTBEAT_FILE = new URL('../../data/office-runtime-heartbeat.json', import.meta.url);
 const PROXY_SAFE_MODELS = new Set(['gpt-5.4', 'gpt-5.3']);
 
 const MODEL_PRICING_TABLE: Array<{ match: RegExp; pricing: ModelPricing }> = [
@@ -1107,6 +1118,18 @@ function loadPersistedState(): PersistedOfficeState | null {
   } catch {
     return null;
   }
+}
+
+function writeRuntimeHeartbeat(payload: {
+  status: DashboardStatus;
+  tickCount: number;
+  employees: Array<{ id: EmployeeId; name: string; taskTitle: string; phase: EmployeePhase; status: string }>;
+  pendingRequests: number;
+  openTerminal: number;
+  updatedAt: string;
+}) {
+  ensurePersistedDirectory();
+  writeFileSync(RUNTIME_HEARTBEAT_FILE, JSON.stringify(payload, null, 2));
 }
 
 function defaultCounterpartForAction(employee: EmployeeRuntimeRecord, type: OfficeActionType): EmployeeId | null {
@@ -2378,6 +2401,10 @@ export class OfficeSimulationEngine {
     for (const employee of this.employees.values()) {
       this.syncLiveMemory(employee);
     }
+    if (this.status.state === 'running') {
+      this.ensureInterval();
+      this.pushSystemLog('Recovered persisted office runtime after restart.');
+    }
   }
 
   getRunnerMeta(): RunnerMeta {
@@ -2549,6 +2576,7 @@ export class OfficeSimulationEngine {
         ? `${this.meta.transport === 'proxy' ? 'Proxy' : 'Direct'} office runtime started on ${this.meta.model ?? DEFAULT_OPENAI_MODEL}.`
         : 'Local office runtime started with scripted behavior.',
     );
+    this.persistState();
     this.broadcast({ type: 'status', payload: this.status });
     this.broadcast({ type: 'employees', payload: this.getEmployeeSnapshot() });
     return { ok: true };
@@ -2586,6 +2614,7 @@ export class OfficeSimulationEngine {
     this.plannerCircuitOpenUntil = 0;
 
     this.pushSystemLog('Runtime paused by operator.');
+    this.persistState();
     this.broadcast({ type: 'status', payload: this.status });
     this.broadcast({ type: 'employees', payload: this.getEmployeeSnapshot() });
     return { ok: true };
@@ -2662,6 +2691,7 @@ export class OfficeSimulationEngine {
     }
 
     this.pushSystemLog('Generated scripted backend test plans for the full office roster.');
+    this.persistState();
     this.broadcast({ type: 'status', payload: this.status });
     const snapshot = this.getEmployeeSnapshot();
     this.broadcast({ type: 'employees', payload: snapshot });
@@ -2708,12 +2738,29 @@ export class OfficeSimulationEngine {
     this.plannerBusy = false;
     this.clearPlannerQueueTimer();
     this.plannerNextAvailableAt = 0;
+    this.persistState();
   }
 
   private hydratePersistedState() {
     const persisted = loadPersistedState();
     if (!persisted) {
       return;
+    }
+
+    if (typeof persisted.tickCount === 'number' && Number.isFinite(persisted.tickCount)) {
+      this.tickCount = persisted.tickCount;
+    }
+    if (persisted.usage) {
+      this.usage = {
+        ...persisted.usage,
+        byModel: Array.isArray(persisted.usage.byModel) ? persisted.usage.byModel.map((entry) => ({ ...entry })) : [],
+      };
+    }
+    if (persisted.status) {
+      this.status = { ...persisted.status };
+    }
+    if (Array.isArray(persisted.logs)) {
+      this.logs = persisted.logs.slice(-MAX_LOG_ENTRIES).map((entry) => ({ ...entry }));
     }
 
     for (const employee of this.employees.values()) {
@@ -2748,6 +2795,14 @@ export class OfficeSimulationEngine {
       this.requests.set(request.id, cloneOfficeRequest(request));
     }
 
+    this.terminalItems.clear();
+    for (const item of persisted.terminalItems ?? []) {
+      if (!item || typeof item.id !== 'string' || !item.id) {
+        continue;
+      }
+      this.terminalItems.set(item.id, { ...item });
+    }
+
     this.officeRecordActivity.clear();
     for (const activity of persisted.officeRecordActivity ?? []) {
       if (!activity || typeof activity.recordId !== 'string' || !activity.recordId) {
@@ -2759,6 +2814,8 @@ export class OfficeSimulationEngine {
     for (const employee of this.employees.values()) {
       this.syncWorkflowRuntimeContext(employee);
     }
+
+    this.writeHeartbeat();
   }
 
   private persistState() {
@@ -2769,6 +2826,14 @@ export class OfficeSimulationEngine {
       processedEmailIds: [...this.processedEmailIds],
       requests: [...this.requests.values()].map(cloneOfficeRequest),
       officeRecordActivity: [...this.officeRecordActivity.values()].map((activity) => ({ ...activity })),
+      terminalItems: [...this.terminalItems.values()].map((item) => ({ ...item })),
+      tickCount: this.tickCount,
+      usage: {
+        ...this.usage,
+        byModel: this.usage.byModel.map((entry) => ({ ...entry })),
+      },
+      status: { ...this.status },
+      logs: this.logs.map((entry) => ({ ...entry })),
     };
 
     for (const employee of this.employees.values()) {
@@ -2783,6 +2848,24 @@ export class OfficeSimulationEngine {
     }
 
     writeFileSync(RUNTIME_STATE_FILE, JSON.stringify(payload, null, 2));
+    this.writeHeartbeat();
+  }
+
+  private writeHeartbeat() {
+    writeRuntimeHeartbeat({
+      status: { ...this.status },
+      tickCount: this.tickCount,
+      employees: [...this.employees.values()].map((employee) => ({
+        id: employee.id,
+        name: employee.name,
+        taskTitle: employee.taskTitle,
+        phase: employee.phase,
+        status: employee.status,
+      })),
+      pendingRequests: [...this.requests.values()].filter((request) => request.status === 'pending').length,
+      openTerminal: [...this.terminalItems.values()].filter((item) => item.status === 'open').length,
+      updatedAt: nowIso(),
+    });
   }
 
   private refreshVaultContext() {
@@ -3101,7 +3184,7 @@ export class OfficeSimulationEngine {
     const count = (this.repetitionCounts.get(key) ?? 0) + 1;
     this.repetitionCounts.set(key, count);
 
-    if (count < 3 || count % 3 !== 0) {
+    if (count < 8 || count % 8 !== 0) {
       return;
     }
 
@@ -3136,9 +3219,25 @@ export class OfficeSimulationEngine {
       source,
       completedAt: nowIso(),
     });
-    if (employee.workflowHabits.recentTaskHistory.length > 18) {
-      employee.workflowHabits.recentTaskHistory = employee.workflowHabits.recentTaskHistory.slice(-18);
+    if (employee.workflowHabits.recentTaskHistory.length > RECENT_TASK_HISTORY_LIMIT) {
+      employee.workflowHabits.recentTaskHistory = employee.workflowHabits.recentTaskHistory.slice(-RECENT_TASK_HISTORY_LIMIT);
     }
+  }
+
+  private shouldRecordReflection(employee: EmployeeRuntimeRecord, title: string) {
+    const latestMatch = [...employee.workflowHabits.reflections]
+      .reverse()
+      .find((entry) => entry.title === title);
+    if (!latestMatch) {
+      return true;
+    }
+
+    const lastRecordedAt = Date.parse(latestMatch.createdAt);
+    if (!Number.isFinite(lastRecordedAt)) {
+      return true;
+    }
+
+    return Date.now() - lastRecordedAt >= REFLECTION_COOLDOWN_MS;
   }
 
   private recordReflection(
@@ -3153,6 +3252,10 @@ export class OfficeSimulationEngine {
       relatedEmployeeId?: EmployeeId | null;
     },
   ) {
+    if (!this.shouldRecordReflection(employee, title)) {
+      return;
+    }
+
     employee.workflowHabits.reflections.push({
       id: randomUUID(),
       createdAt: nowIso(),
@@ -3471,6 +3574,16 @@ export class OfficeSimulationEngine {
 
   private buildOfficeSystemsFallbackPlans(employee: EmployeeRuntimeRecord) {
     const recentTitles = new Set(employee.workflowHabits.recentTaskHistory.slice(-6).map((entry) => entry.title));
+    const globalRecentTitleCounts = [...this.employees.values()].reduce((counts, currentEmployee) => {
+      for (const entry of currentEmployee.workflowHabits.recentTaskHistory) {
+        const completedAt = Date.parse(entry.completedAt);
+        if (!Number.isFinite(completedAt) || Date.now() - completedAt > RECENT_TITLE_WINDOW_MS) {
+          continue;
+        }
+        counts.set(entry.title, (counts.get(entry.title) ?? 0) + 1);
+      }
+      return counts;
+    }, new Map<string, number>());
     const activeRecordIds = new Set(
       [...this.employees.values()]
         .map((otherEmployee) => otherEmployee.currentPlan?.officeRecordId ?? null)
@@ -3501,7 +3614,8 @@ export class OfficeSimulationEngine {
               ? 4
               : 0;
         const noveltyBonus = recentTitles.has(record.title) ? -18 : 6;
-        const repetitionPenalty = activity.completedCount * 2;
+        const recentOfficeRepeats = globalRecentTitleCounts.get(record.title) ?? 0;
+        const repetitionPenalty = activity.completedCount * 3 + recentOfficeRepeats * RECENT_TITLE_REPEAT_PENALTY;
         const sameOwnerPenalty = activity.lastOwnerId === employee.id ? 7 : 0;
         const score =
           priorityWeight +
@@ -4314,6 +4428,10 @@ export class OfficeSimulationEngine {
 
     if (this.tickCount % MEMORY_CONSOLIDATION_INTERVAL === 0) {
       this.consolidateMemories();
+    }
+
+    if (this.tickCount % RUNTIME_HEARTBEAT_INTERVAL === 0) {
+      this.persistState();
     }
 
     this.broadcast({ type: 'employees', payload: this.getEmployeeSnapshot() });
@@ -5318,6 +5436,15 @@ export class OfficeSimulationEngine {
       }
 
       employee.activeMemory = keepActive.sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+      employee.passiveMemory = employee.passiveMemory.filter((item, index, allItems) => {
+        const firstMatchIndex = allItems.findIndex(
+          (candidate) =>
+            candidate.summary === item.summary &&
+            candidate.kind === item.kind &&
+            candidate.referenceId === item.referenceId,
+        );
+        return firstMatchIndex === index;
+      });
       if (employee.passiveMemory.length > PASSIVE_MEMORY_LIMIT) {
         employee.passiveMemory = employee.passiveMemory.slice(-PASSIVE_MEMORY_LIMIT);
       }

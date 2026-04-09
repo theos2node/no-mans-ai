@@ -191,6 +191,25 @@ function appendMarkdownSection(path: string, heading: string, body: string, file
   writeText(path, `${current}${section}`);
 }
 
+function appendUniqueMarkdownSection(
+  path: string,
+  heading: string,
+  body: string,
+  fileTitle = basename(path, extname(path)),
+  dedupeKey?: string,
+) {
+  const normalizedMarker = normalizeMemoryText(dedupeKey ?? body);
+  if (normalizedMarker && fileExists(path)) {
+    const current = normalizeMemoryText(readText(path));
+    if (current.includes(normalizedMarker)) {
+      return false;
+    }
+  }
+
+  appendMarkdownSection(path, heading, body, fileTitle);
+  return true;
+}
+
 function listMarkdownFiles(path: string) {
   if (!dirExists(path)) {
     return [] as string[];
@@ -200,6 +219,10 @@ function listMarkdownFiles(path: string) {
     .map((entry) => join(path, entry))
     .filter((entry) => fileExists(entry) && extname(entry).toLowerCase() === '.md')
     .sort();
+}
+
+function listRecentMarkdownFiles(path: string, limit: number) {
+  return listMarkdownFiles(path).slice(-limit).reverse();
 }
 
 function extractTitle(content: string, fallback: string) {
@@ -374,6 +397,9 @@ function tokenOverlapRatio(left: string, right: string) {
 
   return matches / Math.max(1, Math.min(leftTokens.size, rightTokens.size));
 }
+
+const AGENT_MEMORY_SEARCH_WINDOW = 320;
+const AGENT_MEMORY_INDEX_WINDOW = 240;
 
 export class ObsidianVault {
   readonly rootPath: string;
@@ -915,7 +941,10 @@ export class ObsidianVault {
 
   searchAgentMemories(employeeName: string, query: string, limit = 6) {
     this.ensureEmployeeWorkspace(employeeName);
-    const files = listMarkdownFiles(this.longTermMemoryPath(employeeName));
+    const files = listRecentMarkdownFiles(
+      this.longTermMemoryPath(employeeName),
+      Math.max(limit * 12, AGENT_MEMORY_SEARCH_WINDOW),
+    );
     const tokens = tokenize(query);
 
     const ranked = files.map((path) => {
@@ -943,9 +972,24 @@ export class ObsidianVault {
     });
 
     const filtered = tokens.length > 0 ? ranked.filter((item) => item.score > 0) : ranked;
+    const deduped = new Map<string, VaultAgentMemorySummary & { score: number }>();
 
-    return filtered
-      .sort((left, right) => right.score - left.score || right.createdAt.localeCompare(left.createdAt))
+    for (const item of filtered.sort((left, right) => right.score - left.score || right.createdAt.localeCompare(left.createdAt))) {
+      const key = normalizeMemoryText(`${item.title} ${item.summary}`);
+      const existing = deduped.get(key);
+      if (!existing) {
+        deduped.set(key, item);
+        continue;
+      }
+
+      const existingRecency = existing.createdAt || existing.sourcePath;
+      const itemRecency = item.createdAt || item.sourcePath;
+      if (item.score > existing.score || (item.score === existing.score && itemRecency > existingRecency)) {
+        deduped.set(key, item);
+      }
+    }
+
+    return [...deduped.values()]
       .slice(0, limit)
       .map(({ score: _score, ...item }) => item);
   }
@@ -988,7 +1032,7 @@ export class ObsidianVault {
 
   private loadStoredAgentMemories(employeeName: string, limit = 200) {
     this.ensureEmployeeWorkspace(employeeName);
-    const files = listMarkdownFiles(this.longTermMemoryPath(employeeName)).slice(-limit).reverse();
+    const files = listRecentMarkdownFiles(this.longTermMemoryPath(employeeName), Math.min(limit, AGENT_MEMORY_INDEX_WINDOW));
     return files.map((path) => {
       const content = readText(path);
       return {
@@ -1136,7 +1180,7 @@ export class ObsidianVault {
     ]
       .filter(Boolean)
       .join('\n');
-    appendMarkdownSection(notePath, `${new Date().toISOString()} — ${entry.title}`, body, entry.title);
+    appendUniqueMarkdownSection(notePath, `${new Date().toISOString()} — ${entry.title}`, body, entry.title, `${entry.summary}\n${entry.details}`);
   }
 
   upsertPlaybookProposal(entry: PlaybookProposalEntry) {
@@ -1150,7 +1194,7 @@ export class ObsidianVault {
       '### Recommended Rule',
       entry.recommendation,
     ].join('\n');
-    appendMarkdownSection(notePath, `${new Date().toISOString()} — Proposal`, body, entry.title);
+    appendUniqueMarkdownSection(notePath, `${new Date().toISOString()} — Proposal`, body, entry.title, entry.recommendation);
   }
 
   appendTerminalEvent(entry: TerminalEventEntry) {

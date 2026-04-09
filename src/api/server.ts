@@ -37,6 +37,7 @@ async function readJsonBody<T>(request: IncomingMessage): Promise<T> {
 
 const runtime = new OfficeSimulationEngine({ planner });
 const clients = new Set<ServerResponse>();
+let shuttingDown = false;
 
 runtime.subscribe((event) => {
   for (const client of clients) {
@@ -145,9 +146,28 @@ server.listen(PORT, () => {
   console.log(`No Man's AI API listening on http://localhost:${PORT}`);
 });
 
+function shutdownServer(exitCode: number) {
+  if (shuttingDown) {
+    return;
+  }
+  shuttingDown = true;
+  runtime.shutdown();
+  server.close(() => process.exit(exitCode));
+  setTimeout(() => process.exit(exitCode), 1_000).unref();
+}
+
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.on(signal, () => {
-    runtime.shutdown();
-    server.close(() => process.exit(0));
+    shutdownServer(0);
   });
 }
+
+process.on('uncaughtException', (error) => {
+  console.error('No Man\'s AI API uncaught exception:', error);
+  shutdownServer(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('No Man\'s AI API unhandled rejection:', reason);
+  shutdownServer(1);
+});
