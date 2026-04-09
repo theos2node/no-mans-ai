@@ -159,7 +159,12 @@ interface ApiOfficeRequest {
   toId: string;
   locationId: string;
   status: string;
+  createdAt: string;
   updatedAt: string;
+  decisionSummary: string | null;
+  readAt: string | null;
+  replyingAt: string | null;
+  replyReadAt: string | null;
 }
 
 interface ApiTerminalItem {
@@ -172,6 +177,20 @@ interface ApiTerminalItem {
   locationId: string;
 }
 
+interface ApiMailboxEmail {
+  id: string;
+  title: string;
+  subject: string;
+  fromName: string;
+  from: string;
+  toName: string;
+  to: string;
+  body: string;
+  summary: string;
+  sourcePath: string;
+  updatedAt: string;
+}
+
 interface ApiPlaybookRule {
   id: string;
   title: string;
@@ -182,6 +201,22 @@ interface ApiKnowledgeNote {
   id: string;
   title: string;
   summary: string;
+}
+
+interface ApiOfficeSystemRecord {
+  id: string;
+  kind: 'backlog' | 'client' | 'project' | 'finance' | 'internal_note';
+  title: string;
+  summary: string;
+  status: string;
+  priority: string;
+  owner: string;
+  lane: string;
+  locationId: string;
+  tags: string[];
+  checklist: string[];
+  sourcePath: string;
+  updatedAt: string;
 }
 
 interface ApiEmployeeState {
@@ -229,6 +264,15 @@ interface ApiEmployeeSnapshot {
     inboxCount: number;
     sentCount: number;
     pendingSubjects: string[];
+    inbox: ApiMailboxEmail[];
+    sent: ApiMailboxEmail[];
+  };
+  officeSystems?: {
+    backlog: ApiOfficeSystemRecord[];
+    clients: ApiOfficeSystemRecord[];
+    projects: ApiOfficeSystemRecord[];
+    finance: ApiOfficeSystemRecord[];
+    notes: ApiOfficeSystemRecord[];
   };
   summary?: {
     pendingRequests: number;
@@ -275,6 +319,16 @@ interface LayoutPayload {
 
 type ConsoleSection = 'walkways' | 'locations' | 'doors';
 type ConsoleTool = 'add-walkway' | 'remove-walkway' | 'place-location' | 'place-entrance' | 'place-exit' | null;
+type EmailWorkspaceTab = 'inbox' | 'compose' | 'sent' | 'messages' | 'work' | 'clients' | 'projects' | 'finance' | 'notes';
+
+interface ComposeEmailDraft {
+  fromName: string;
+  fromEmail: string;
+  toName: string;
+  toEmail: string;
+  subject: string;
+  body: string;
+}
 
 const TICK_MS = 45;
 const SPRITE_SIZE = 96;
@@ -332,6 +386,104 @@ function requestStatusLabel(status: string) {
     default:
       return status;
   }
+}
+
+function defaultDeskEmailAddress(employee: ApiEmployeeState | null | undefined) {
+  if (!employee) {
+    return 'desk@no-mans-ai.local';
+  }
+
+  return `${employee.id}@no-mans-ai.local`;
+}
+
+function isAtAssignedDesk(employee: ApiEmployeeState | null | undefined) {
+  return Boolean(employee && employee.currentLocationId === employee.assignedLocationId);
+}
+
+function mailboxDisplay(name: string, email: string) {
+  return name.trim() || email.trim() || 'Unknown';
+}
+
+function formatMailboxTime(timestamp: string) {
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) {
+    return '--';
+  }
+
+  return date.toLocaleString([], {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  });
+}
+
+function employeeNameFor(snapshot: ApiEmployeeSnapshot | null, employeeId: string) {
+  return employeeById(snapshot, employeeId)?.name ?? employeeId;
+}
+
+function messageNotificationCount(snapshot: ApiEmployeeSnapshot | null, employeeId: string) {
+  return (snapshot?.requests ?? []).filter((request) => {
+    const unreadInbound = request.toId === employeeId && request.status === 'pending' && !request.readAt;
+    const unreadReply = request.fromId === employeeId && Boolean(request.decisionSummary) && !request.replyReadAt;
+    return unreadInbound || unreadReply;
+  }).length;
+}
+
+function messageStateLabel(request: ApiOfficeRequest, employeeId: string) {
+  if (request.fromId === employeeId) {
+    if (request.decisionSummary && !request.replyReadAt) {
+      return 'reply';
+    }
+    if (request.replyingAt) {
+      return 'currently replying';
+    }
+    if (request.readAt) {
+      return 'read';
+    }
+    return 'sent';
+  }
+
+  if (request.toId === employeeId) {
+    if (request.replyingAt) {
+      return 'currently replying';
+    }
+    if (request.readAt) {
+      return 'read';
+    }
+    return 'new';
+  }
+
+  return 'read';
+}
+
+function messageCounterpartLabel(snapshot: ApiEmployeeSnapshot | null, request: ApiOfficeRequest, employeeId: string) {
+  return request.fromId === employeeId ? employeeNameFor(snapshot, request.toId) : employeeNameFor(snapshot, request.fromId);
+}
+
+function officeRecordMeta(record: ApiOfficeSystemRecord) {
+  return `${record.priority} priority · ${record.status}`;
+}
+
+function compactStatus(value: string) {
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function formatRuntimeDuration(startedAt: string | null, now = Date.now()) {
+  if (!startedAt) {
+    return '--';
+  }
+
+  const startMs = Date.parse(startedAt);
+  if (!Number.isFinite(startMs)) {
+    return '--';
+  }
+
+  const diffSeconds = Math.max(0, Math.floor((now - startMs) / 1000));
+  const hours = Math.floor(diffSeconds / 3600);
+  const minutes = Math.floor((diffSeconds % 3600) / 60);
+  const seconds = diffSeconds % 60;
+  return [hours, minutes, seconds].map((value) => String(value).padStart(2, '0')).join(':');
 }
 
 const directionFrames: Record<Direction, [number, number, number]> = {
@@ -1413,6 +1565,21 @@ export default function App() {
   const [apiMeta, setApiMeta] = useState<ApiMeta | null>(null);
   const [apiConnected, setApiConnected] = useState(false);
   const [selectedStaffId, setSelectedStaffId] = useState<string | null>(null);
+  const [deskPcEmployeeId, setDeskPcEmployeeId] = useState<string | null>(null);
+  const [emailWorkspaceTab, setEmailWorkspaceTab] = useState<EmailWorkspaceTab>('inbox');
+  const [selectedMailboxEmailId, setSelectedMailboxEmailId] = useState<string | null>(null);
+  const [selectedOfficeRequestId, setSelectedOfficeRequestId] = useState<string | null>(null);
+  const [selectedOfficeRecordId, setSelectedOfficeRecordId] = useState<string | null>(null);
+  const [composeDraft, setComposeDraft] = useState<ComposeEmailDraft>({
+    fromName: '',
+    fromEmail: '',
+    toName: '',
+    toEmail: '',
+    subject: '',
+    body: '',
+  });
+  const [sendError, setSendError] = useState<string | null>(null);
+  const [isSendingEmail, setIsSendingEmail] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [consoleSection, setConsoleSection] = useState<ConsoleSection>('walkways');
   const [consoleTool, setConsoleTool] = useState<ConsoleTool>(null);
@@ -1459,6 +1626,56 @@ export default function App() {
   useEffect(() => {
     setSelectedLocationId((current) => current ?? locations[0]?.id ?? null);
   }, [locations]);
+
+  useEffect(() => {
+    if (view === 'dashboard') {
+      setDeskPcEmployeeId(null);
+      setSelectedMailboxEmailId(null);
+      setSelectedOfficeRequestId(null);
+    }
+  }, [view]);
+
+  useEffect(() => {
+    if (deskPcEmployeeId && selectedStaffId !== deskPcEmployeeId) {
+      setDeskPcEmployeeId(null);
+      setSelectedMailboxEmailId(null);
+      setSelectedOfficeRequestId(null);
+      setSendError(null);
+    }
+  }, [deskPcEmployeeId, selectedStaffId]);
+
+  useEffect(() => {
+    if (!deskPcEmployeeId) {
+      return;
+    }
+
+    const employee = employeeById(employeeSnapshot, deskPcEmployeeId);
+    if (!employee || !isAtAssignedDesk(employee)) {
+      setDeskPcEmployeeId(null);
+      setSelectedMailboxEmailId(null);
+      setSelectedOfficeRequestId(null);
+    }
+  }, [deskPcEmployeeId, employeeSnapshot]);
+
+  useEffect(() => {
+    if (!deskPcEmployeeId) {
+      return;
+    }
+
+    const employee = employeeById(employeeSnapshot, deskPcEmployeeId);
+    setComposeDraft({
+      fromName: employee?.name ?? '',
+      fromEmail: defaultDeskEmailAddress(employee),
+      toName: '',
+      toEmail: '',
+      subject: '',
+      body: '',
+    });
+    setEmailWorkspaceTab('inbox');
+    setSelectedMailboxEmailId(null);
+    setSelectedOfficeRequestId(null);
+    setSendError(null);
+  }, [deskPcEmployeeId]);
 
   useEffect(() => {
     if (!selectedLocationId || locations.some((location) => location.id === selectedLocationId)) {
@@ -2067,6 +2284,83 @@ export default function App() {
     paintGridFromPointer(event.clientX, event.clientY);
   }
 
+  function openDeskPc(employeeId: string) {
+    setDeskPcEmployeeId(employeeId);
+    setEmailWorkspaceTab('inbox');
+    setSelectedMailboxEmailId(null);
+    setSelectedOfficeRequestId(null);
+    setSelectedOfficeRecordId(null);
+    setSendError(null);
+  }
+
+  function switchEmailWorkspaceTab(nextTab: EmailWorkspaceTab) {
+    setEmailWorkspaceTab(nextTab);
+    setSelectedMailboxEmailId(null);
+    setSelectedOfficeRequestId(null);
+    setSelectedOfficeRecordId(null);
+    setSendError(null);
+  }
+
+  async function handleDeskPcSend() {
+    const employee = employeeById(employeeSnapshot, deskPcEmployeeId ?? '');
+    if (!employee) {
+      setSendError('Desk PC is unavailable until the office snapshot loads.');
+      return;
+    }
+
+    const payload = {
+      employeeId: employee.id,
+      fromName: composeDraft.fromName.trim(),
+      from: composeDraft.fromEmail.trim(),
+      toName: composeDraft.toName.trim(),
+      to: composeDraft.toEmail.trim(),
+      subject: composeDraft.subject.trim(),
+      body: composeDraft.body.trim(),
+    };
+
+    if (!payload.fromName || !payload.from || !payload.toName || !payload.to || !payload.subject || !payload.body) {
+      setSendError('Fill in from, to, subject, and content before sending.');
+      return;
+    }
+
+    setIsSendingEmail(true);
+    setSendError(null);
+
+    try {
+      const response = await fetch('/api/emails/send', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
+      const result = (await response.json().catch(() => null)) as { error?: string } | null;
+      if (!response.ok) {
+        throw new Error(result?.error || 'Unable to send email from the desk PC.');
+      }
+
+      const employeesResponse = await fetch('/api/employees');
+      if (employeesResponse.ok) {
+        setEmployeeSnapshot((await employeesResponse.json()) as ApiEmployeeSnapshot);
+      }
+
+      setComposeDraft({
+        fromName: employee.name,
+        fromEmail: defaultDeskEmailAddress(employee),
+        toName: '',
+        toEmail: '',
+        subject: '',
+        body: '',
+      });
+      setEmailWorkspaceTab('sent');
+      setSelectedMailboxEmailId(null);
+    } catch (error) {
+      setSendError(error instanceof Error ? error.message : 'Unable to send email from the desk PC.');
+    } finally {
+      setIsSendingEmail(false);
+    }
+  }
+
   if (!navigation || !world || !staffTest) {
     return (
       <main className="sim-shell loading-shell">
@@ -2081,9 +2375,6 @@ export default function App() {
   const runnerStatus = apiSnapshot?.status.state ?? localRunState;
   const apiLiveConfigured = Boolean(apiConnected && apiMeta?.live);
   const isLiveSpending = apiLiveConfigured && runnerStatus === 'running' && !isTesting;
-  const dashboardRequests = employeeSnapshot ? employeeSnapshot.usage.requestCount.toLocaleString() : apiConnected && apiLiveConfigured ? '--' : '0';
-  const dashboardTokens = employeeSnapshot ? employeeSnapshot.usage.totalTokens.toLocaleString() : apiConnected && apiLiveConfigured ? '--' : '0';
-  const dashboardCost = employeeSnapshot ? `$${employeeSnapshot.usage.estimatedCostUsd.toFixed(2)}` : apiConnected && apiLiveConfigured ? '--' : '$0.00';
   const modelBreakdown = employeeSnapshot?.usage.byModel ?? [];
   const transportLabel =
     apiMeta?.transport === 'proxy'
@@ -2149,6 +2440,7 @@ export default function App() {
       position: employeeById(employeeSnapshot, 'sam')?.position ?? actorProfiles.sam.thought.title,
       status: employeeById(employeeSnapshot, 'sam')?.status ?? actorStatusText(world.actors.sam, locations),
       bio: employeeById(employeeSnapshot, 'sam')?.bio ?? 'Steady and patient, Sam keeps the front-end work calm and organized.',
+      taskTitle: employeeById(employeeSnapshot, 'sam')?.taskTitle ?? actorProfiles.sam.thought.title,
       objective:
         employeeById(employeeSnapshot, 'sam')?.objective ?? 'Keep the React lane moving without dropping review discipline.',
       currentAction: employeeById(employeeSnapshot, 'sam')?.currentAction ?? null,
@@ -2171,6 +2463,7 @@ export default function App() {
       position: employeeById(employeeSnapshot, 'jeremy')?.position ?? actorProfiles.jeremy.thought.title,
       status: employeeById(employeeSnapshot, 'jeremy')?.status ?? actorStatusText(world.actors.jeremy, locations),
       bio: employeeById(employeeSnapshot, 'jeremy')?.bio ?? 'Direct and reliable, Jeremy likes quick fixes that remove blockers fast.',
+      taskTitle: employeeById(employeeSnapshot, 'jeremy')?.taskTitle ?? actorProfiles.jeremy.thought.title,
       objective:
         employeeById(employeeSnapshot, 'jeremy')?.objective ?? 'Keep the React lane moving without dropping review discipline.',
       currentAction: employeeById(employeeSnapshot, 'jeremy')?.currentAction ?? null,
@@ -2196,6 +2489,7 @@ export default function App() {
         position: backendEmployee?.position ?? staff.position,
         status: backendEmployee?.status ?? staffStatusText(mover, staff, locations),
         bio: backendEmployee?.bio ?? staff.bio,
+        taskTitle: backendEmployee?.taskTitle ?? staff.position,
         objective: backendEmployee?.objective ?? `${staff.position} is keeping their lane moving inside office policy.`,
         currentAction: backendEmployee?.currentAction ?? null,
         location: locationById(backendEmployee?.currentLocationId ?? mover?.currentLocationId ?? staff.locationId, locations)?.label ?? staff.position,
@@ -2215,6 +2509,140 @@ export default function App() {
       };
     }),
   ];
+  const deskPcEmployee = employeeById(employeeSnapshot, deskPcEmployeeId ?? '');
+  const deskPcInbox = [...(employeeSnapshot?.emailSimulator?.inbox ?? [])].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  const deskPcSent = [...(employeeSnapshot?.emailSimulator?.sent ?? [])].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  const deskPcMessages = [...(employeeSnapshot?.requests ?? [])]
+    .filter((request) => request.fromId === deskPcEmployeeId || request.toId === deskPcEmployeeId)
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  const deskPcWork = [...(employeeSnapshot?.officeSystems?.backlog ?? [])].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  const deskPcClients = [...(employeeSnapshot?.officeSystems?.clients ?? [])].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  const deskPcProjects = [...(employeeSnapshot?.officeSystems?.projects ?? [])].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  const deskPcFinance = [...(employeeSnapshot?.officeSystems?.finance ?? [])].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  const deskPcNotes = [...(employeeSnapshot?.officeSystems?.notes ?? [])].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  const deskPcRecords =
+    emailWorkspaceTab === 'work'
+      ? deskPcWork
+      : emailWorkspaceTab === 'clients'
+        ? deskPcClients
+        : emailWorkspaceTab === 'projects'
+          ? deskPcProjects
+          : emailWorkspaceTab === 'finance'
+            ? deskPcFinance
+            : emailWorkspaceTab === 'notes'
+              ? deskPcNotes
+              : [];
+  const selectedDeskPcEmail =
+    emailWorkspaceTab === 'inbox'
+      ? deskPcInbox.find((email) => email.id === selectedMailboxEmailId) ?? null
+      : deskPcSent.find((email) => email.id === selectedMailboxEmailId) ?? null;
+  const selectedDeskPcRequest = deskPcMessages.find((request) => request.id === selectedOfficeRequestId) ?? null;
+  const selectedDeskPcRecord = deskPcRecords.find((record) => record.id === selectedOfficeRecordId) ?? null;
+  const dashboardLogLines = [...(apiSnapshot?.logs ?? [])].slice(-18).reverse();
+  const dashboardPendingRequests = employeeSnapshot?.summary?.pendingRequests ?? 0;
+  const dashboardWorking = employeeSnapshot?.summary?.employeesWorking ?? 0;
+  const dashboardWaiting = employeeSnapshot?.summary?.employeesWaiting ?? 0;
+  const dashboardOpenTerminal = employeeSnapshot?.summary?.openTerminal ?? 0;
+  const dashboardRuntime = formatRuntimeDuration(apiSnapshot?.status.startedAt ?? null);
+  const dashboardInboxCount = employeeSnapshot?.emailSimulator?.inboxCount ?? 0;
+  const dashboardSentCount = employeeSnapshot?.emailSimulator?.sentCount ?? 0;
+  const dashboardBacklogCount = employeeSnapshot?.officeSystems?.backlog.length ?? 0;
+  const dashboardClientCount = employeeSnapshot?.officeSystems?.clients.length ?? 0;
+  const dashboardProjectCount = employeeSnapshot?.officeSystems?.projects.length ?? 0;
+  const dashboardFinanceCount = employeeSnapshot?.officeSystems?.finance.length ?? 0;
+  const dashboardNoteCount = employeeSnapshot?.officeSystems?.notes.length ?? 0;
+  const dashboardPendingRequestLines = [...(employeeSnapshot?.requests ?? [])]
+    .filter((request) => request.status !== 'fulfilled' && request.status !== 'archived')
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+    .slice(0, 4)
+    .map((request) => {
+      const fromName = employeeById(employeeSnapshot, request.fromId)?.name ?? request.fromId;
+      const toName = employeeById(employeeSnapshot, request.toId)?.name ?? request.toId;
+      return `${request.kind} · ${fromName} -> ${toName} · ${compactStatus(request.title)} · ${request.status}`;
+    });
+  const dashboardRecentResolvedRequestLines = [...(employeeSnapshot?.requests ?? [])]
+    .filter((request) => request.status === 'fulfilled' || request.status === 'archived')
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+    .slice(0, 4)
+    .map((request) => {
+      const fromName = employeeById(employeeSnapshot, request.fromId)?.name ?? request.fromId;
+      const toName = employeeById(employeeSnapshot, request.toId)?.name ?? request.toId;
+      return `${request.kind} · ${fromName} -> ${toName} · ${compactStatus(request.title)} · ${formatMailboxTime(request.updatedAt)}`;
+    });
+  const dashboardTerminalItems = [...(employeeSnapshot?.terminal?.items ?? [])].slice(0, 4);
+  const dashboardRuntimeLines = [
+    `session_state      ${runnerStatus}`,
+    `session_started    ${apiSnapshot?.status.startedAt ? formatMailboxTime(apiSnapshot.status.startedAt) : '--'}`,
+    `session_runtime    ${dashboardRuntime}`,
+    `runner_mode        ${modeLabel}`,
+    `transport          ${transportLabel}`,
+    `runner_pid         ${apiSnapshot?.status.pid ?? '--'}`,
+    `office_mode        ${employeeSnapshot?.mode ?? (apiLiveConfigured ? 'live' : 'local')}`,
+    `usage_tracking     ${
+      employeeSnapshot && (employeeSnapshot.usage.requestCount > 0 || employeeSnapshot.usage.totalTokens > 0)
+        ? runtimeUsageLabel
+        : apiConnected && apiLiveConfigured
+          ? 'connected but idle'
+          : 'inactive in local scripted mode'
+    }`,
+  ];
+  const dashboardOfficeLines = [
+    `working            ${dashboardWorking}`,
+    `waiting            ${dashboardWaiting}`,
+    `pending_requests   ${dashboardPendingRequests}`,
+    `open_terminal      ${dashboardOpenTerminal}`,
+    `inbox              ${dashboardInboxCount}`,
+    `sent               ${dashboardSentCount}`,
+    `backlog            ${dashboardBacklogCount}`,
+    `clients            ${dashboardClientCount}`,
+    `projects           ${dashboardProjectCount}`,
+    `finance            ${dashboardFinanceCount}`,
+    `notes              ${dashboardNoteCount}`,
+  ];
+  const terminalDashboardOutput = [
+    `Last login: ${apiSnapshot?.status.startedAt ? formatMailboxTime(apiSnapshot.status.startedAt) : '--'} on ttys001`,
+    'operator@office ~ % office-runtime --watch',
+    '',
+    '[session]',
+    ...dashboardRuntimeLines,
+    '',
+    '[office]',
+    ...dashboardOfficeLines,
+    '',
+    ...staffDossiers.flatMap((entry) => [
+      `[sprout:${entry.name.toLowerCase()}]`,
+      `name               ${entry.name}`,
+      `role               ${entry.position}`,
+      `workflow           ${entry.taskTitle}`,
+      `step               ${entry.currentAction ?? 'waiting-for-next-live-action'}`,
+      `status             ${compactStatus(entry.status)}`,
+      `location           ${entry.location}`,
+      `requests_in        ${entry.inboundRequests.length}`,
+      `requests_out       ${entry.outboundRequests.length}`,
+      `notes              ${entry.privateNoteCount ?? 0}`,
+      ...(entry.currentEmailSubject ? [`email_subject      ${entry.currentEmailSubject}`] : []),
+      `objective          ${compactStatus(entry.objective ?? 'n/a')}`,
+      'checklist          ',
+      ...entry.checklist.slice(0, 6).map((item, index) => `  [${index + 1}] ${compactStatus(item)}`),
+      entry.activeMemory.length > 0 ? `recent_memory      ${compactStatus(entry.activeMemory.slice(-1)[0]?.summary ?? 'none')}` : 'recent_memory      none',
+      '',
+    ]),
+    '[requests:pending]',
+    ...(dashboardPendingRequestLines.length > 0 ? dashboardPendingRequestLines : ['none']),
+    '',
+    '[requests:recent]',
+    ...(dashboardRecentResolvedRequestLines.length > 0 ? dashboardRecentResolvedRequestLines : ['none']),
+    '',
+    '[terminal:queue]',
+    ...(dashboardTerminalItems.length > 0
+      ? dashboardTerminalItems.map((item) => `${item.priority} · ${compactStatus(item.title)} · ${compactStatus(item.summary)}`)
+      : ['none']),
+    '',
+    `operator@office % tail -n ${dashboardLogLines.length} runtime.log`,
+    ...(dashboardLogLines.length > 0
+      ? dashboardLogLines.map((line) => `[${formatMailboxTime(line.timestamp)}] ${line.source.toUpperCase()} ${line.line}`)
+      : ['No runtime log lines yet.']),
+  ].join('\n');
 
   return (
     <main className="sim-shell">
@@ -2406,200 +2834,20 @@ export default function App() {
       ) : null}
 
       {view === 'dashboard' ? (
-        <section className="dashboard-screen">
-          <header className="dashboard-header">
-            <div>
-              <p className="editor-eyebrow">Dashboard</p>
-              <h1 className="dashboard-title">Office Dossier</h1>
-              <p className="dashboard-copy">Live status for every staffed role, with current assignment and activity text.</p>
-            </div>
-            <div className="dashboard-metrics">
-              <div className="metric-card">
-                <span className="metric-label">Mode</span>
-                <strong>{modeLabel}</strong>
+        <section className="terminal-dashboard">
+          <div className="console-window">
+            <div className="console-chrome">
+              <div className="console-dots">
+                <span className="console-dot is-close" />
+                <span className="console-dot is-min" />
+                <span className="console-dot is-max" />
               </div>
-              <div className="metric-card">
-                <span className="metric-label">Requests</span>
-                <strong>{dashboardRequests}</strong>
-              </div>
-              <div className="metric-card">
-                <span className="metric-label">Tokens Used</span>
-                <strong>{dashboardTokens}</strong>
-              </div>
-              <div className="metric-card">
-                <span className="metric-label">Estimated Cost</span>
-                <strong>{dashboardCost}</strong>
-              </div>
-              <div className="metric-card">
-                <span className="metric-label">Transport</span>
-                <strong>{transportLabel}</strong>
-              </div>
-              <div className="metric-card">
-                <span className="metric-label">Runner</span>
-                <strong>{runnerStatus}</strong>
-              </div>
-            </div>
-          </header>
-
-          <div className="dashboard-scroll">
-            <div className="dashboard-panels">
-              <article className="dashboard-sidecard">
-                <p className="sidecard-label">Red Terminal</p>
-                <strong className="sidecard-value">
-                  {employeeSnapshot?.terminal?.openCount ?? 0} open
-                </strong>
-                <ul className="sidecard-list">
-                  {(employeeSnapshot?.terminal?.items ?? []).slice(0, 4).map((item) => (
-                    <li key={item.id}>
-                      <span>{item.title}</span>
-                      <span>{item.priority}</span>
-                    </li>
-                  ))}
-                  {!employeeSnapshot?.terminal?.items?.length ? <li>No active escalations</li> : null}
-                </ul>
-              </article>
-
-              <article className="dashboard-sidecard">
-                <p className="sidecard-label">Office State</p>
-                <strong className="sidecard-value">
-                  {employeeSnapshot?.summary?.pendingRequests ?? 0} pending requests
-                </strong>
-                <ul className="sidecard-list">
-                  <li>Working: {employeeSnapshot?.summary?.employeesWorking ?? 0}</li>
-                  <li>Waiting: {employeeSnapshot?.summary?.employeesWaiting ?? 0}</li>
-                  <li>Open terminal: {employeeSnapshot?.summary?.openTerminal ?? 0}</li>
-                  <li>Total requests: {employeeSnapshot?.requests?.length ?? 0}</li>
-                </ul>
-              </article>
-
-              <article className="dashboard-sidecard">
-                <p className="sidecard-label">Playbook</p>
-                <strong className="sidecard-value">{employeeSnapshot?.playbook?.length ?? 0} rules</strong>
-                <ul className="sidecard-list">
-                  {(employeeSnapshot?.playbook ?? []).map((rule) => (
-                    <li key={rule.id}>{rule.title}</li>
-                  ))}
-                </ul>
-              </article>
-
-              <article className="dashboard-sidecard">
-                <p className="sidecard-label">Archives</p>
-                <strong className="sidecard-value">{employeeSnapshot?.knowledgeBase?.length ?? 0} shared notes</strong>
-                <ul className="sidecard-list">
-                  {(employeeSnapshot?.knowledgeBase ?? []).map((note) => (
-                    <li key={note.id}>
-                      <span>{note.title}</span>
-                      <span>{note.summary}</span>
-                    </li>
-                  ))}
-                </ul>
-              </article>
-
-              <article className="dashboard-sidecard">
-                <p className="sidecard-label">Email Simulator</p>
-                <strong className="sidecard-value">{employeeSnapshot?.emailSimulator?.inboxCount ?? 0} inbox</strong>
-                <ul className="sidecard-list">
-                  <li>Sent: {employeeSnapshot?.emailSimulator?.sentCount ?? 0}</li>
-                  {(employeeSnapshot?.emailSimulator?.pendingSubjects ?? []).map((subject) => (
-                    <li key={subject}>{subject}</li>
-                  ))}
-                  {!employeeSnapshot?.emailSimulator?.pendingSubjects?.length ? <li>No pending email subjects</li> : null}
-                </ul>
-              </article>
-
-              <article className="dashboard-sidecard">
-                <p className="sidecard-label">Missing Staff</p>
-                <strong className="sidecard-value">Status unknown</strong>
-                <ul className="sidecard-list">
-                  {unavailableRoster.map((name) => (
-                    <li key={name}>{name}</li>
-                  ))}
-                </ul>
-              </article>
+              <p className="console-title">office-runtime.console</p>
             </div>
 
-            {staffDossiers.map((entry) => (
-              <article className="dossier-card" key={entry.id}>
-                <div className="dossier-head">
-                  <div className="dossier-identity">
-                    <div className="dossier-avatar">
-                      <div className="pixel-sprite dossier-avatar-sprite" style={getSpriteStyle(entry.strip, idleFrame('down'))} />
-                    </div>
-                    <div>
-                      <h2 className="dossier-name">{entry.name}</h2>
-                      <p className="dossier-position">{entry.position}</p>
-                    </div>
-                  </div>
-                  <span className="dossier-status">{entry.status}</span>
-                </div>
-                <p className="dossier-location">Current location: {entry.location}</p>
-                <p className="dossier-objective">{entry.objective}</p>
-                {entry.currentAction ? <p className="dossier-current-action">Current action: {entry.currentAction}</p> : null}
-                <p className="dossier-bio">{entry.bio}</p>
-                <div className="dossier-meta-row">
-                  <span>Inbound: {entry.inboundRequests.length}</span>
-                  <span>Outbound: {entry.outboundRequests.length}</span>
-                  <span>Passive memory: {entry.passiveMemoryCount}</span>
-                  <span>Memory notes: {entry.privateNoteCount ?? 0}</span>
-                </div>
-                {entry.currentEmailSubject ? <p className="dossier-current-action">Email: {entry.currentEmailSubject}</p> : null}
-                <ul className="dossier-list">
-                  {entry.checklist.map((item) => (
-                    <li key={item}>{item}</li>
-                  ))}
-                </ul>
-                {entry.inboundRequests.length > 0 || entry.outboundRequests.length > 0 ? (
-                  <div className="dossier-request-groups">
-                    {entry.inboundRequests.length > 0 ? (
-                      <div className="request-group">
-                        <p className="request-group-label">Inbound Requests</p>
-                        <ul className="request-list">
-                          {entry.inboundRequests.map((request) => (
-                            <li key={request.id}>
-                              <span>{request.title}</span>
-                              <span>
-                                {requestStatusLabel(request.status)} · {request.counterpartName}
-                              </span>
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                    ) : null}
-                    {entry.outboundRequests.length > 0 ? (
-                      <div className="request-group">
-                        <p className="request-group-label">Outbound Requests</p>
-                        <ul className="request-list">
-                          {entry.outboundRequests.map((request) => (
-                            <li key={request.id}>
-                              <span>{request.title}</span>
-                              <span>
-                                {requestStatusLabel(request.status)} · {request.counterpartName}
-                              </span>
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                    ) : null}
-                  </div>
-                ) : null}
-                {entry.activeMemory.length > 0 ? (
-                  <div className="memory-group">
-                    <p className="request-group-label">Active Memory</p>
-                    <ul className="memory-list">
-                      {entry.activeMemory.slice(-3).map((memory) => (
-                        <li key={memory.id}>{memory.summary}</li>
-                      ))}
-                    </ul>
-                  </div>
-                ) : null}
-                {entry.performance ? (
-                  <p className="dossier-performance">
-                    Quality {entry.performance.qualityScore.toFixed(2)} · Plans {entry.performance.completedPlans} · Corrections {entry.performance.corrections} · Escalations{' '}
-                    {entry.performance.escalations}
-                  </p>
-                ) : null}
-              </article>
-            ))}
+            <div className="console-screen">
+              <pre className="console-output">{terminalDashboardOutput}</pre>
+            </div>
           </div>
         </section>
       ) : null}
@@ -2677,6 +2925,9 @@ export default function App() {
           const frameIndex = mover?.frameIndex ?? fixedStaffFrame(staff.direction, world.tick, staff.animationOffset);
           const placement = thoughtPlacement(x);
           const isExpanded = selectedStaffId === staff.id;
+          const canUseDeskPc = apiConnected && isAtAssignedDesk(backendEmployee);
+          const unreadMessages = messageNotificationCount(employeeSnapshot, staff.id);
+          const currentLocationLabel = locationById(backendEmployee?.currentLocationId ?? mover?.currentLocationId ?? staff.locationId, locations)?.label ?? staff.position;
 
           return (
             <div
@@ -2686,10 +2937,29 @@ export default function App() {
             >
               {!shouldShowGrid && isExpanded ? (
                 <div className={`thought-anchor is-${placement}`}>
-                  <section className="thought-panel staff-card">
-                    <p className="thought-panel-title">{backendEmployee?.name ?? staff.name}</p>
-                    <p className="staff-role">{backendEmployee?.position ?? staff.position}</p>
-                    <p className="staff-bio">{backendEmployee?.bio ?? staff.bio}</p>
+                    <section className="thought-panel staff-card">
+                      <p className="thought-panel-title">{backendEmployee?.name ?? staff.name}</p>
+                      <p className="staff-role">{backendEmployee?.position ?? staff.position}</p>
+                      <p className="staff-bio">{backendEmployee?.bio ?? staff.bio}</p>
+                      <p className="staff-workflow">Workflow: {backendEmployee?.taskTitle ?? staff.position}</p>
+                      <p className="staff-step">Step: {backendEmployee?.currentAction ?? backendEmployee?.status ?? 'Waiting for the next office action.'}</p>
+                      {(backendEmployee?.checklist?.length ?? 0) > 0 ? (
+                        <ul className="staff-checklist">
+                          {(backendEmployee?.checklist ?? []).slice(0, 3).map((item) => (
+                            <li key={item}>{item}</li>
+                          ))}
+                        </ul>
+                      ) : null}
+                      <p className="staff-station">Messages: {unreadMessages} new</p>
+                      <p className="staff-station">{canUseDeskPc ? 'At assigned desk' : `Away from desk: ${currentLocationLabel}`}</p>
+                    <button
+                      className="desk-tool-button"
+                      disabled={!canUseDeskPc}
+                      onClick={() => openDeskPc(staff.id)}
+                      type="button"
+                    >
+                      {deskPcEmployeeId === staff.id ? 'Desk PC Open' : 'Open Desk PC'}
+                    </button>
                   </section>
                 </div>
               ) : null}
@@ -2709,6 +2979,13 @@ export default function App() {
             const actor = world.actors[actorId];
             const profile = actorProfiles[actorId];
             const offset = crowdOffsetsByEntity.get(actorId) ?? { x: 0, y: 0 };
+            const backendEmployee = employeeById(employeeSnapshot, actorId);
+            const placement = thoughtPlacement(actor.x + offset.x);
+            const isExpanded = selectedStaffId === actorId;
+            const canUseDeskPc = apiConnected && isAtAssignedDesk(backendEmployee);
+            const unreadMessages = messageNotificationCount(employeeSnapshot, actorId);
+            const currentLocationLabel =
+              locationById(backendEmployee?.currentLocationId ?? actor.currentLocationId ?? profile.startLocationId, locations)?.label ?? profile.thought.title;
 
             return (
               <div
@@ -2720,12 +2997,404 @@ export default function App() {
                   pointerEvents: shouldShowGrid ? 'none' : 'auto',
                 }}
               >
-                <div className="pixel-sprite office-sprite" style={getSpriteStyle(profile.strip, actor.frameIndex)} />
+                {!shouldShowGrid && isExpanded ? (
+                  <div className={`thought-anchor is-${placement}`}>
+                    <section className="thought-panel staff-card">
+                      <p className="thought-panel-title">{backendEmployee?.name ?? actorId}</p>
+                      <p className="staff-role">{backendEmployee?.position ?? profile.thought.title}</p>
+                      <p className="staff-bio">{backendEmployee?.bio ?? 'Focused on the current desk workflow.'}</p>
+                      <p className="staff-workflow">Workflow: {backendEmployee?.taskTitle ?? profile.thought.title}</p>
+                      <p className="staff-step">Step: {backendEmployee?.currentAction ?? backendEmployee?.status ?? 'Waiting for the next office action.'}</p>
+                      {(backendEmployee?.checklist?.length ?? 0) > 0 ? (
+                        <ul className="staff-checklist">
+                          {(backendEmployee?.checklist ?? []).slice(0, 3).map((item) => (
+                            <li key={item}>{item}</li>
+                          ))}
+                        </ul>
+                      ) : null}
+                      <p className="staff-station">Messages: {unreadMessages} new</p>
+                      <p className="staff-station">{canUseDeskPc ? 'At assigned desk' : `Away from desk: ${currentLocationLabel}`}</p>
+                      <button
+                        className="desk-tool-button"
+                        disabled={!canUseDeskPc}
+                        onClick={() => openDeskPc(actorId)}
+                        type="button"
+                      >
+                        {deskPcEmployeeId === actorId ? 'Desk PC Open' : 'Open Desk PC'}
+                      </button>
+                    </section>
+                  </div>
+                ) : null}
+                <button
+                  aria-label={`${backendEmployee?.name ?? actorId}, ${backendEmployee?.position ?? profile.thought.title}`}
+                  className={`actor-sprite-button ${isExpanded ? 'is-active' : ''}`}
+                  onClick={() => setSelectedStaffId((current) => (current === actorId ? null : actorId))}
+                  type="button"
+                >
+                  <div className="pixel-sprite office-sprite" style={getSpriteStyle(profile.strip, actor.frameIndex)} />
+                </button>
               </div>
             );
           })}
         </div>
       </section>
+
+      {view === 'office' && deskPcEmployee ? (
+        <aside className="desk-pc-window">
+          <div className="desk-pc-header">
+            <div>
+              <p className="desk-pc-eyebrow">Desk PC</p>
+              <h2>{deskPcEmployee.name}</h2>
+              <p>
+                {deskPcEmployee.position} · {messageNotificationCount(employeeSnapshot, deskPcEmployee.id)} new messages
+              </p>
+              <p className="desk-pc-runtime">
+                Workflow: {deskPcEmployee.taskTitle}
+                {deskPcEmployee.currentAction ? ` · Step: ${deskPcEmployee.currentAction}` : ''}
+              </p>
+            </div>
+            <button
+              className="desk-pc-close"
+              onClick={() => {
+                setDeskPcEmployeeId(null);
+                setSelectedMailboxEmailId(null);
+                setSelectedOfficeRequestId(null);
+                setSelectedOfficeRecordId(null);
+              }}
+              type="button"
+            >
+              Close
+            </button>
+          </div>
+
+          <div className="desk-pc-tabs">
+            <button
+              className={`desk-pc-tab ${emailWorkspaceTab === 'inbox' ? 'is-active' : ''}`}
+              onClick={() => switchEmailWorkspaceTab('inbox')}
+              type="button"
+            >
+              Inbox ({deskPcInbox.length})
+            </button>
+            <button
+              className={`desk-pc-tab ${emailWorkspaceTab === 'compose' ? 'is-active' : ''}`}
+              onClick={() => switchEmailWorkspaceTab('compose')}
+              type="button"
+            >
+              Compose
+            </button>
+            <button
+              className={`desk-pc-tab ${emailWorkspaceTab === 'sent' ? 'is-active' : ''}`}
+              onClick={() => switchEmailWorkspaceTab('sent')}
+              type="button"
+            >
+              Sent ({deskPcSent.length})
+            </button>
+            <button
+              className={`desk-pc-tab ${emailWorkspaceTab === 'messages' ? 'is-active' : ''}`}
+              onClick={() => switchEmailWorkspaceTab('messages')}
+              type="button"
+            >
+              Messages ({deskPcMessages.length})
+            </button>
+            <button
+              className={`desk-pc-tab ${emailWorkspaceTab === 'work' ? 'is-active' : ''}`}
+              onClick={() => switchEmailWorkspaceTab('work')}
+              type="button"
+            >
+              Work ({deskPcWork.length})
+            </button>
+            <button
+              className={`desk-pc-tab ${emailWorkspaceTab === 'clients' ? 'is-active' : ''}`}
+              onClick={() => switchEmailWorkspaceTab('clients')}
+              type="button"
+            >
+              Clients ({deskPcClients.length})
+            </button>
+            <button
+              className={`desk-pc-tab ${emailWorkspaceTab === 'projects' ? 'is-active' : ''}`}
+              onClick={() => switchEmailWorkspaceTab('projects')}
+              type="button"
+            >
+              Projects ({deskPcProjects.length})
+            </button>
+            <button
+              className={`desk-pc-tab ${emailWorkspaceTab === 'finance' ? 'is-active' : ''}`}
+              onClick={() => switchEmailWorkspaceTab('finance')}
+              type="button"
+            >
+              Finance ({deskPcFinance.length})
+            </button>
+            <button
+              className={`desk-pc-tab ${emailWorkspaceTab === 'notes' ? 'is-active' : ''}`}
+              onClick={() => switchEmailWorkspaceTab('notes')}
+              type="button"
+            >
+              Notes ({deskPcNotes.length})
+            </button>
+          </div>
+
+          {emailWorkspaceTab === 'compose' ? (
+            <div className="desk-pc-compose">
+              <label className="desk-pc-field">
+                <span>From name</span>
+                <input
+                  onChange={(event) => setComposeDraft((current) => ({ ...current, fromName: event.target.value }))}
+                  type="text"
+                  value={composeDraft.fromName}
+                />
+              </label>
+              <label className="desk-pc-field">
+                <span>From email</span>
+                <input
+                  onChange={(event) => setComposeDraft((current) => ({ ...current, fromEmail: event.target.value }))}
+                  type="email"
+                  value={composeDraft.fromEmail}
+                />
+              </label>
+              <label className="desk-pc-field">
+                <span>To name</span>
+                <input
+                  onChange={(event) => setComposeDraft((current) => ({ ...current, toName: event.target.value }))}
+                  type="text"
+                  value={composeDraft.toName}
+                />
+              </label>
+              <label className="desk-pc-field">
+                <span>To email</span>
+                <input
+                  onChange={(event) => setComposeDraft((current) => ({ ...current, toEmail: event.target.value }))}
+                  type="email"
+                  value={composeDraft.toEmail}
+                />
+              </label>
+              <label className="desk-pc-field">
+                <span>Subject</span>
+                <input
+                  onChange={(event) => setComposeDraft((current) => ({ ...current, subject: event.target.value }))}
+                  type="text"
+                  value={composeDraft.subject}
+                />
+              </label>
+              <label className="desk-pc-field desk-pc-field-wide">
+                <span>Content</span>
+                <textarea onChange={(event) => setComposeDraft((current) => ({ ...current, body: event.target.value }))} value={composeDraft.body} />
+              </label>
+              {sendError ? <p className="desk-pc-error">{sendError}</p> : null}
+              <div className="desk-pc-compose-actions">
+                <button className="desk-pc-send" disabled={isSendingEmail} onClick={() => void handleDeskPcSend()} type="button">
+                  {isSendingEmail ? 'Sending...' : 'Send'}
+                </button>
+              </div>
+            </div>
+          ) : emailWorkspaceTab === 'messages' || emailWorkspaceTab === 'work' || emailWorkspaceTab === 'clients' || emailWorkspaceTab === 'projects' || emailWorkspaceTab === 'finance' || emailWorkspaceTab === 'notes' ? null : (
+              <div className="desk-pc-body">
+                <div className="desk-pc-list">
+                {(emailWorkspaceTab === 'inbox' ? deskPcInbox : deskPcSent).map((email) => {
+                  const label =
+                    emailWorkspaceTab === 'inbox'
+                      ? mailboxDisplay(email.fromName, email.from)
+                      : mailboxDisplay(email.toName, email.to);
+
+                  return (
+                    <button
+                      className={`desk-pc-list-item ${selectedMailboxEmailId === email.id ? 'is-active' : ''}`}
+                      key={email.id}
+                      onClick={() => setSelectedMailboxEmailId(email.id)}
+                      type="button"
+                    >
+                      <strong>{email.subject}</strong>
+                      <span>{label}</span>
+                      <span>{formatMailboxTime(email.updatedAt)}</span>
+                    </button>
+                  );
+                })}
+                {(emailWorkspaceTab === 'inbox' ? deskPcInbox : deskPcSent).length === 0 ? (
+                  <p className="desk-pc-empty">{emailWorkspaceTab === 'inbox' ? 'No inbox emails yet.' : 'No sent emails yet.'}</p>
+                ) : null}
+              </div>
+
+              <div className="desk-pc-preview">
+                {selectedDeskPcEmail ? (
+                  <>
+                    <p className="desk-pc-preview-subject">{selectedDeskPcEmail.subject}</p>
+                    <dl className="desk-pc-meta">
+                      <div>
+                        <dt>Name</dt>
+                        <dd>
+                          {emailWorkspaceTab === 'inbox'
+                            ? mailboxDisplay(selectedDeskPcEmail.fromName, selectedDeskPcEmail.from)
+                            : mailboxDisplay(selectedDeskPcEmail.toName, selectedDeskPcEmail.to)}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Email</dt>
+                        <dd>{emailWorkspaceTab === 'inbox' ? selectedDeskPcEmail.from : selectedDeskPcEmail.to}</dd>
+                      </div>
+                      <div>
+                        <dt>Subject</dt>
+                        <dd>{selectedDeskPcEmail.subject}</dd>
+                      </div>
+                      <div>
+                        <dt>Time</dt>
+                        <dd>{formatMailboxTime(selectedDeskPcEmail.updatedAt)}</dd>
+                      </div>
+                    </dl>
+                    {emailWorkspaceTab === 'sent' ? (
+                      <p className="desk-pc-route">
+                        From {mailboxDisplay(selectedDeskPcEmail.fromName, selectedDeskPcEmail.from)} to{' '}
+                        {mailboxDisplay(selectedDeskPcEmail.toName, selectedDeskPcEmail.to)}
+                      </p>
+                    ) : null}
+                    <pre className="desk-pc-content">{selectedDeskPcEmail.body}</pre>
+                  </>
+                ) : (
+                  <p className="desk-pc-empty">Click an email to open it.</p>
+                )}
+              </div>
+            </div>
+          )}
+          {emailWorkspaceTab === 'messages' ? (
+            <div className="desk-pc-body">
+              <div className="desk-pc-list">
+                {deskPcMessages.map((request) => (
+                  <button
+                    className={`desk-pc-list-item ${selectedOfficeRequestId === request.id ? 'is-active' : ''}`}
+                    key={request.id}
+                    onClick={() => setSelectedOfficeRequestId(request.id)}
+                    type="button"
+                  >
+                    <strong>{request.title}</strong>
+                    <span>{messageCounterpartLabel(employeeSnapshot, request, deskPcEmployee.id)}</span>
+                    <span>{messageStateLabel(request, deskPcEmployee.id)}</span>
+                  </button>
+                ))}
+                {deskPcMessages.length === 0 ? <p className="desk-pc-empty">No messages yet.</p> : null}
+              </div>
+
+              <div className="desk-pc-preview">
+                {selectedDeskPcRequest ? (
+                  <>
+                    <p className="desk-pc-preview-subject">{selectedDeskPcRequest.title}</p>
+                    <dl className="desk-pc-meta">
+                      <div>
+                        <dt>From</dt>
+                        <dd>{employeeNameFor(employeeSnapshot, selectedDeskPcRequest.fromId)}</dd>
+                      </div>
+                      <div>
+                        <dt>To</dt>
+                        <dd>{employeeNameFor(employeeSnapshot, selectedDeskPcRequest.toId)}</dd>
+                      </div>
+                      <div>
+                        <dt>Kind</dt>
+                        <dd>{selectedDeskPcRequest.kind}</dd>
+                      </div>
+                      <div>
+                        <dt>Status</dt>
+                        <dd>{selectedDeskPcRequest.status}</dd>
+                      </div>
+                      <div>
+                        <dt>Thread</dt>
+                        <dd>{messageStateLabel(selectedDeskPcRequest, deskPcEmployee.id)}</dd>
+                      </div>
+                      <div>
+                        <dt>Started</dt>
+                        <dd>{formatMailboxTime(selectedDeskPcRequest.createdAt)}</dd>
+                      </div>
+                    </dl>
+                    <div className="desk-pc-message-thread">
+                      <section className="desk-pc-message-card">
+                        <p className="desk-pc-message-label">Message</p>
+                        <p className="desk-pc-message-author">{employeeNameFor(employeeSnapshot, selectedDeskPcRequest.fromId)}</p>
+                        <pre className="desk-pc-content">{selectedDeskPcRequest.details}</pre>
+                      </section>
+                      {selectedDeskPcRequest.decisionSummary ? (
+                        <section className="desk-pc-message-card is-reply">
+                          <p className="desk-pc-message-label">Reply</p>
+                          <p className="desk-pc-message-author">{employeeNameFor(employeeSnapshot, selectedDeskPcRequest.toId)}</p>
+                          <pre className="desk-pc-content">{selectedDeskPcRequest.decisionSummary}</pre>
+                        </section>
+                      ) : null}
+                    </div>
+                  </>
+                ) : (
+                  <p className="desk-pc-empty">Click a message to open it.</p>
+                )}
+              </div>
+            </div>
+          ) : null}
+          {emailWorkspaceTab === 'work' || emailWorkspaceTab === 'clients' || emailWorkspaceTab === 'projects' || emailWorkspaceTab === 'finance' || emailWorkspaceTab === 'notes' ? (
+            <div className="desk-pc-body">
+              <div className="desk-pc-list">
+                {deskPcRecords.map((record) => (
+                  <button
+                    className={`desk-pc-list-item ${selectedOfficeRecordId === record.id ? 'is-active' : ''}`}
+                    key={record.id}
+                    onClick={() => setSelectedOfficeRecordId(record.id)}
+                    type="button"
+                  >
+                    <strong>{record.title}</strong>
+                    <span>{officeRecordMeta(record)}</span>
+                    <span>{formatMailboxTime(record.updatedAt)}</span>
+                  </button>
+                ))}
+                {deskPcRecords.length === 0 ? <p className="desk-pc-empty">No {emailWorkspaceTab} records yet.</p> : null}
+              </div>
+
+              <div className="desk-pc-preview">
+                {selectedDeskPcRecord ? (
+                  <>
+                    <p className="desk-pc-preview-subject">{selectedDeskPcRecord.title}</p>
+                    <dl className="desk-pc-meta">
+                      <div>
+                        <dt>Lane</dt>
+                        <dd>{selectedDeskPcRecord.lane}</dd>
+                      </div>
+                      <div>
+                        <dt>Owner</dt>
+                        <dd>{selectedDeskPcRecord.owner}</dd>
+                      </div>
+                      <div>
+                        <dt>Status</dt>
+                        <dd>{selectedDeskPcRecord.status}</dd>
+                      </div>
+                      <div>
+                        <dt>Priority</dt>
+                        <dd>{selectedDeskPcRecord.priority}</dd>
+                      </div>
+                      <div>
+                        <dt>Surface</dt>
+                        <dd>{emailWorkspaceTab === 'work' ? 'Backlog' : emailWorkspaceTab === 'clients' ? 'Clients' : emailWorkspaceTab === 'projects' ? 'Projects' : emailWorkspaceTab === 'finance' ? 'Finance' : 'Notes'}</dd>
+                      </div>
+                      <div>
+                        <dt>Updated</dt>
+                        <dd>{formatMailboxTime(selectedDeskPcRecord.updatedAt)}</dd>
+                      </div>
+                    </dl>
+                    <p className="desk-pc-route">{selectedDeskPcRecord.summary}</p>
+                    {selectedDeskPcRecord.tags.length > 0 ? (
+                      <p className="desk-pc-route">Tags: {selectedDeskPcRecord.tags.join(', ')}</p>
+                    ) : null}
+                    {selectedDeskPcRecord.checklist.length > 0 ? (
+                      <div className="desk-pc-record-checklist">
+                        <p className="desk-pc-message-label">{emailWorkspaceTab === 'notes' ? 'Checklist' : 'Live Checklist'}</p>
+                        <ul className="desk-pc-record-list">
+                          {selectedDeskPcRecord.checklist.map((item) => (
+                            <li key={item}>{item}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : null}
+                  </>
+                ) : (
+                  <p className="desk-pc-empty">
+                    Click a {emailWorkspaceTab === 'work' ? 'work item' : emailWorkspaceTab === 'finance' ? 'finance' : emailWorkspaceTab.slice(0, -1)} record to open it.
+                  </p>
+                )}
+              </div>
+            </div>
+          ) : null}
+        </aside>
+      ) : null}
     </main>
   );
 }

@@ -40,11 +40,32 @@ export interface VaultEmail {
   id: string;
   title: string;
   subject: string;
+  fromName: string;
   from: string;
+  toName: string;
   to: string;
   body: string;
   summary: string;
   sourcePath: string;
+  updatedAt: string;
+}
+
+export type VaultOfficeSystemKind = 'backlog' | 'client' | 'project' | 'finance' | 'internal_note';
+
+export interface VaultOfficeSystemRecord {
+  id: string;
+  kind: VaultOfficeSystemKind;
+  title: string;
+  summary: string;
+  status: string;
+  priority: string;
+  owner: string;
+  lane: string;
+  locationId: string;
+  tags: string[];
+  checklist: string[];
+  sourcePath: string;
+  updatedAt: string;
 }
 
 interface AgentLogEntry {
@@ -81,6 +102,13 @@ interface AgentMemoryEntry {
   relatedEmployeeName?: string | null;
 }
 
+interface StoredAgentMemoryEntry extends AgentMemoryEntry {
+  sourcePath: string;
+  createdAt: string;
+  updatedAt: string | null;
+  occurrences: number;
+}
+
 interface TerminalEventEntry {
   title: string;
   summary: string;
@@ -90,7 +118,9 @@ interface TerminalEventEntry {
 
 interface SentEmailEntry {
   subject: string;
+  toName: string;
   to: string;
+  fromName: string;
   from: string;
   body: string;
   sentBy: string;
@@ -105,6 +135,11 @@ interface LiveMemoryEntry {
   checklist: string[];
   openLoops: string[];
   recentContext?: string[];
+}
+
+interface OfficeSeedEntry {
+  fileName: string;
+  content: string;
 }
 
 const DEFAULT_VAULT_ROOT = fileURLToPath(new URL("../../the archives/No man's AI", import.meta.url));
@@ -187,11 +222,50 @@ function extractField(content: string, field: string) {
 }
 
 function stripMetadata(content: string) {
-  return content
-    .split('\n')
-    .filter((line) => !/^(from|to|subject|tags|source):/i.test(line.trim()))
-    .join('\n')
-    .trim();
+  const lines = content.split('\n');
+  const filtered = lines.filter((line, index) => {
+    const trimmed = line.trim();
+    if (index === 0 && /^#\s+/i.test(trimmed)) {
+      return false;
+    }
+
+    return !/^(from|to|subject|tags|source):/i.test(trimmed);
+  });
+
+  return filtered.join('\n').trim();
+}
+
+function inferNameFromEmail(email: string) {
+  const localPart = email.split('@')[0]?.trim() ?? '';
+  return localPart.replace(/[._-]+/g, ' ').trim() || 'Unknown sender';
+}
+
+function parseMailbox(value: string, fallbackEmail: string) {
+  const normalized = value.trim();
+  const mailboxMatch = normalized.match(/^(.*?)<([^>]+)>$/);
+  if (mailboxMatch) {
+    const name = mailboxMatch[1]?.trim().replace(/^"|"$/g, '') || inferNameFromEmail(mailboxMatch[2] ?? fallbackEmail);
+    const email = mailboxMatch[2]?.trim() || fallbackEmail;
+    return { name, email };
+  }
+
+  if (normalized.includes('@')) {
+    return {
+      name: inferNameFromEmail(normalized),
+      email: normalized,
+    };
+  }
+
+  return {
+    name: normalized || inferNameFromEmail(fallbackEmail),
+    email: fallbackEmail,
+  };
+}
+
+function formatMailbox(name: string, email: string) {
+  const normalizedName = name.trim();
+  const normalizedEmail = email.trim();
+  return normalizedName ? `${normalizedName} <${normalizedEmail}>` : normalizedEmail;
 }
 
 function splitFrontmatter(content: string) {
@@ -277,6 +351,30 @@ function scoreQuery(text: string, tokens: string[]) {
   return tokens.reduce((score, token) => (haystack.includes(token) ? score + 1 : score), 0);
 }
 
+function normalizeMemoryText(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function tokenOverlapRatio(left: string, right: string) {
+  const leftTokens = new Set(tokenize(left));
+  const rightTokens = new Set(tokenize(right));
+  if (leftTokens.size === 0 || rightTokens.size === 0) {
+    return 0;
+  }
+
+  let matches = 0;
+  for (const token of leftTokens) {
+    if (rightTokens.has(token)) {
+      matches += 1;
+    }
+  }
+
+  return matches / Math.max(1, Math.min(leftTokens.size, rightTokens.size));
+}
+
 export class ObsidianVault {
   readonly rootPath: string;
   readonly agentsPath: string;
@@ -288,6 +386,12 @@ export class ObsidianVault {
   readonly emailInboxPath: string;
   readonly emailProcessedPath: string;
   readonly emailSentPath: string;
+  readonly officeSystemsPath: string;
+  readonly officeBacklogPath: string;
+  readonly officeClientsPath: string;
+  readonly officeProjectsPath: string;
+  readonly officeFinancePath: string;
+  readonly officeNotesPath: string;
 
   constructor(rootPath = DEFAULT_VAULT_ROOT) {
     this.rootPath = rootPath;
@@ -300,6 +404,12 @@ export class ObsidianVault {
     this.emailInboxPath = join(this.emailPath, 'Inbox');
     this.emailProcessedPath = join(this.emailPath, 'Processed Inbox');
     this.emailSentPath = join(this.emailPath, 'Sent');
+    this.officeSystemsPath = join(rootPath, 'Office Systems');
+    this.officeBacklogPath = join(this.officeSystemsPath, 'Backlog');
+    this.officeClientsPath = join(this.officeSystemsPath, 'Clients');
+    this.officeProjectsPath = join(this.officeSystemsPath, 'Projects');
+    this.officeFinancePath = join(this.officeSystemsPath, 'Finance');
+    this.officeNotesPath = join(this.officeSystemsPath, 'Internal Notes');
     this.ensureStructure();
   }
 
@@ -323,6 +433,324 @@ export class ObsidianVault {
     return join(this.employeeWorkspacePath(employeeName), 'legacy-notes');
   }
 
+  private officeSeedsForPath(path: string): OfficeSeedEntry[] {
+    if (path === this.officeBacklogPath) {
+      return [
+        {
+          fileName: 'implementation-lane-audit.md',
+          content: [
+            formatFrontmatter({
+              type: 'office_backlog',
+              status: 'active',
+              priority: 'high',
+              owner: 'Sam',
+              lane: 'implementation',
+              location: 'react-c',
+              tags: 'implementation, coverage, frontend',
+            }),
+            '# Implementation lane audit',
+            '',
+            '## Overview',
+            'React coverage needs a cleaner handoff between active customer work and internal implementation passes.',
+            '',
+            '## Checklist',
+            '- [ ] Refresh the current implementation packet.',
+            '- [ ] Review recent office notes for repeated blockers.',
+            '- [ ] Propose the next implementation direction.',
+            '',
+            '## Handoff',
+            'Keep the next pass small and visible so the other desk can pick it up without a reset.',
+            '',
+          ].join('\n'),
+        },
+        {
+          fileName: 'customer-follow-up-gap.md',
+          content: [
+            formatFrontmatter({
+              type: 'office_backlog',
+              status: 'active',
+              priority: 'medium',
+              owner: 'Jeremy',
+              lane: 'service',
+              location: 'customer-relations',
+              tags: 'customer, follow-up, response',
+            }),
+            '# Customer follow-up gap',
+            '',
+            '## Overview',
+            'The office needs a repeatable follow-up packet for new signups and delivery updates while the service desk is unstaffed.',
+            '',
+            '## Checklist',
+            '- [ ] Review recent customer-facing email outcomes.',
+            '- [ ] Draft a standard follow-up rhythm.',
+            '- [ ] Flag where a second opinion helps.',
+            '',
+            '## Handoff',
+            'A reusable response rhythm matters more than speed on this packet.',
+            '',
+          ].join('\n'),
+        },
+        {
+          fileName: 'coverage-playbook-cleanup.md',
+          content: [
+            formatFrontmatter({
+              type: 'office_backlog',
+              status: 'review',
+              priority: 'medium',
+              owner: 'Shared',
+              lane: 'operations',
+              location: 'war-room',
+              tags: 'leadership, process, review',
+            }),
+            '# Coverage playbook cleanup',
+            '',
+            '## Overview',
+            'Temporary office coverage rules are accumulating, and the latest version needs consolidation into one durable playbook.',
+            '',
+            '## Checklist',
+            '- [ ] Compare the latest coverage notes.',
+            '- [ ] Remove duplicate guidance.',
+            '- [ ] Record the clean version for future shifts.',
+            '',
+            '## Handoff',
+            'Do not rewrite the whole playbook if only one section changed.',
+            '',
+          ].join('\n'),
+        },
+      ];
+    }
+
+    if (path === this.officeClientsPath) {
+      return [
+        {
+          fileName: 'northstar-outfitters.md',
+          content: [
+            formatFrontmatter({
+              type: 'office_client',
+              status: 'active',
+              priority: 'high',
+              owner: 'Customer Relations',
+              lane: 'service',
+              location: 'customer-relations',
+              tags: 'client, shipping, onboarding',
+            }),
+            '# Northstar Outfitters',
+            '',
+            '## Overview',
+            'Northstar Outfitters is waiting on a cleaner onboarding and delivery-update cadence after account creation.',
+            '',
+            '## Checklist',
+            '- [ ] Review the latest welcome and delivery language.',
+            '- [ ] Confirm response timing expectations.',
+            '- [ ] Capture any exceptions for the next office pass.',
+            '',
+          ].join('\n'),
+        },
+        {
+          fileName: 'signal-harbor.md',
+          content: [
+            formatFrontmatter({
+              type: 'office_client',
+              status: 'watch',
+              priority: 'medium',
+              owner: 'Shared',
+              lane: 'service',
+              location: 'customer-relations',
+              tags: 'client, retention, support',
+            }),
+            '# Signal Harbor',
+            '',
+            '## Overview',
+            'Signal Harbor has been stable, but the office wants a clearer retention note in case support volume spikes again.',
+            '',
+            '## Checklist',
+            '- [ ] Review prior support tone.',
+            '- [ ] Note any missing customer promises.',
+            '- [ ] Keep a quick retention response ready.',
+            '',
+          ].join('\n'),
+        },
+      ];
+    }
+
+    if (path === this.officeProjectsPath) {
+      return [
+        {
+          fileName: 'office-response-playbook.md',
+          content: [
+            formatFrontmatter({
+              type: 'office_project',
+              status: 'active',
+              priority: 'high',
+              owner: 'Sam',
+              lane: 'implementation',
+              location: 'react-c',
+              tags: 'project, playbook, implementation',
+            }),
+            '# Office response playbook',
+            '',
+            '## Overview',
+            'Build a stable internal response playbook so email, review requests, and handoffs feel like one office system.',
+            '',
+            '## Checklist',
+            '- [ ] Review recent workflow reflections.',
+            '- [ ] Fold the best habits into one project direction.',
+            '- [ ] Share the next iteration with the other desk.',
+            '',
+          ].join('\n'),
+        },
+        {
+          fileName: 'desk-pc-surface-pass.md',
+          content: [
+            formatFrontmatter({
+              type: 'office_project',
+              status: 'active',
+              priority: 'medium',
+              owner: 'Jeremy',
+              lane: 'implementation',
+              location: 'react-d',
+              tags: 'project, tooling, desk-pc',
+            }),
+            '# Desk PC surface pass',
+            '',
+            '## Overview',
+            'The desk PC should expose the office systems directly so workers can browse tasks, clients, finance packets, and notes without leaving the desk.',
+            '',
+            '## Checklist',
+            '- [ ] Audit what the desk PC already shows.',
+            '- [ ] Keep the layout lightweight.',
+            '- [ ] Make the office artifacts easy to scan.',
+            '',
+          ].join('\n'),
+        },
+      ];
+    }
+
+    if (path === this.officeFinancePath) {
+      return [
+        {
+          fileName: 'refund-watch.md',
+          content: [
+            formatFrontmatter({
+              type: 'office_finance',
+              status: 'review',
+              priority: 'high',
+              owner: 'Coordinator',
+              lane: 'finance',
+              location: 'coordinator',
+              tags: 'finance, refund, reconciliation',
+            }),
+            '# Refund watch',
+            '',
+            '## Overview',
+            'A small set of customer promises may create refund pressure if response timing slips again.',
+            '',
+            '## Checklist',
+            '- [ ] Review the current exception packet.',
+            '- [ ] Compare it with the playbook threshold.',
+            '- [ ] Record whether owner approval is likely.',
+            '',
+          ].join('\n'),
+        },
+        {
+          fileName: 'ledger-reconciliation.md',
+          content: [
+            formatFrontmatter({
+              type: 'office_finance',
+              status: 'active',
+              priority: 'medium',
+              owner: 'Shared',
+              lane: 'finance',
+              location: 'coordinator',
+              tags: 'finance, ledger, operations',
+            }),
+            '# Ledger reconciliation',
+            '',
+            '## Overview',
+            'Coordination notes and finance packets need a cleaner end-of-cycle reconciliation before the office scales up again.',
+            '',
+            '## Checklist',
+            '- [ ] Pull the latest packet.',
+            '- [ ] Check for mismatched statuses.',
+            '- [ ] Record the next reconciliation step.',
+            '',
+          ].join('\n'),
+        },
+      ];
+    }
+
+    return [
+      {
+        fileName: 'office-rhythm-notes.md',
+        content: [
+          formatFrontmatter({
+            type: 'office_internal_note',
+            status: 'active',
+            priority: 'medium',
+            owner: 'Shared',
+            lane: 'operations',
+            location: 'war-room',
+            tags: 'notes, workflow, handoff',
+          }),
+          '# Office rhythm notes',
+          '',
+          '## Overview',
+          'Capture what makes the two-desk office feel smooth so it can keep running for long stretches.',
+          '',
+          '## Checklist',
+          '- [ ] Keep notes on good handoffs.',
+          '- [ ] Capture where the office stalled.',
+          '- [ ] Turn repeated wins into office habits.',
+          '',
+        ].join('\n'),
+      },
+      {
+        fileName: 'handoff-packet-template.md',
+        content: [
+          formatFrontmatter({
+            type: 'office_internal_note',
+            status: 'reference',
+            priority: 'low',
+            owner: 'Shared',
+            lane: 'operations',
+            location: 'archives',
+            tags: 'notes, handoff, template',
+          }),
+          '# Handoff packet template',
+          '',
+          '## Overview',
+          'A minimal template for leaving the other desk enough context to continue a task without replaying the whole office day.',
+          '',
+          '## Checklist',
+          '- [ ] What changed',
+          '- [ ] What still needs doing',
+          '- [ ] What to avoid repeating',
+          '',
+        ].join('\n'),
+      },
+    ];
+  }
+
+  private ensureSeededOfficeSystems() {
+    const seedDirectories = [
+      this.officeBacklogPath,
+      this.officeClientsPath,
+      this.officeProjectsPath,
+      this.officeFinancePath,
+      this.officeNotesPath,
+    ];
+
+    for (const directory of seedDirectories) {
+      if (listMarkdownFiles(directory).length > 0) {
+        continue;
+      }
+
+      for (const seed of this.officeSeedsForPath(directory)) {
+        writeText(join(directory, seed.fileName), seed.content);
+      }
+    }
+  }
+
   ensureStructure() {
     ensureDir(this.rootPath);
     ensureDir(this.agentsPath);
@@ -334,6 +762,13 @@ export class ObsidianVault {
     ensureDir(this.emailInboxPath);
     ensureDir(this.emailProcessedPath);
     ensureDir(this.emailSentPath);
+    ensureDir(this.officeSystemsPath);
+    ensureDir(this.officeBacklogPath);
+    ensureDir(this.officeClientsPath);
+    ensureDir(this.officeProjectsPath);
+    ensureDir(this.officeFinancePath);
+    ensureDir(this.officeNotesPath);
+    this.ensureSeededOfficeSystems();
   }
 
   ensureEmployeeWorkspace(employeeName: string) {
@@ -384,6 +819,42 @@ export class ObsidianVault {
         summary: extractSummary(content),
         sourcePath: path,
       } satisfies VaultKnowledgeSummary;
+    });
+  }
+
+  loadOfficeSystemRecords(kind: VaultOfficeSystemKind, limit = 12) {
+    const directory =
+      kind === 'backlog'
+        ? this.officeBacklogPath
+        : kind === 'client'
+          ? this.officeClientsPath
+          : kind === 'project'
+            ? this.officeProjectsPath
+            : kind === 'finance'
+              ? this.officeFinancePath
+              : this.officeNotesPath;
+    const files = listMarkdownFiles(directory).slice(0, limit);
+
+    return files.map((path) => {
+      const content = readText(path);
+      const title = extractTitle(content, basename(path, '.md'));
+      const overview = extractSection(content, 'Overview');
+
+      return {
+        id: slugify(`${kind}-${basename(path, '.md')}`),
+        kind,
+        title,
+        summary: (overview || extractSummary(content)).slice(0, 280),
+        status: extractFrontmatterField(content, 'status') || 'active',
+        priority: extractFrontmatterField(content, 'priority') || 'medium',
+        owner: extractFrontmatterField(content, 'owner') || 'Shared',
+        lane: extractFrontmatterField(content, 'lane') || 'operations',
+        locationId: extractFrontmatterField(content, 'location') || '',
+        tags: extractFrontmatterList(content, 'tags'),
+        checklist: extractChecklist(extractSection(content, 'Checklist')),
+        sourcePath: path,
+        updatedAt: statSync(path).mtime.toISOString(),
+      } satisfies VaultOfficeSystemRecord;
     });
   }
 
@@ -486,16 +957,18 @@ export class ObsidianVault {
     appendMarkdownSection(dailyPath, `${new Date().toISOString()} — ${entry.heading}`, entry.body, `${entry.employeeName} Log`);
   }
 
-  appendAgentMemory(entry: AgentMemoryEntry) {
-    this.ensureEmployeeWorkspace(entry.employeeName);
-    const timestamp = new Date().toISOString();
-    const notePath = join(this.longTermMemoryPath(entry.employeeName), `${timestamp.replace(/[:]/g, '-')}-${slugify(entry.title)}.md`);
-    const content = [
+  private renderAgentMemoryContent(
+    entry: AgentMemoryEntry,
+    timestamps: { createdAt: string; updatedAt: string | null; occurrences: number },
+  ) {
+    return [
       formatFrontmatter({
         type: 'agent_memory',
         agent: entry.employeeName,
         kind: entry.kind,
-        created_at: timestamp,
+        created_at: timestamps.createdAt,
+        updated_at: timestamps.updatedAt ?? '',
+        occurrences: timestamps.occurrences,
         importance: entry.importance ?? 1,
         reference_id: entry.referenceId ?? '',
         related_location: entry.relatedLocationId ?? '',
@@ -511,7 +984,122 @@ export class ObsidianVault {
       entry.details.trim(),
       '',
     ].join('\n');
+  }
+
+  private loadStoredAgentMemories(employeeName: string, limit = 200) {
+    this.ensureEmployeeWorkspace(employeeName);
+    const files = listMarkdownFiles(this.longTermMemoryPath(employeeName)).slice(-limit).reverse();
+    return files.map((path) => {
+      const content = readText(path);
+      return {
+        employeeName,
+        title: extractTitle(content, basename(path, '.md')),
+        summary: extractSection(content, 'Summary') || extractSummary(content),
+        details: extractSection(content, 'Details') || splitFrontmatter(content).body,
+        kind: extractFrontmatterField(content, 'kind') || 'note',
+        tags: extractFrontmatterList(content, 'tags'),
+        referenceId: extractFrontmatterField(content, 'reference_id') || null,
+        importance: Number.parseInt(extractFrontmatterField(content, 'importance') || '1', 10) || 1,
+        relatedLocationId: extractFrontmatterField(content, 'related_location') || null,
+        relatedEmployeeName: extractFrontmatterField(content, 'related_employee') || null,
+        sourcePath: path,
+        createdAt: extractFrontmatterField(content, 'created_at') || statSync(path).mtime.toISOString(),
+        updatedAt: extractFrontmatterField(content, 'updated_at') || null,
+        occurrences: Number.parseInt(extractFrontmatterField(content, 'occurrences') || '1', 10) || 1,
+      } satisfies StoredAgentMemoryEntry;
+    });
+  }
+
+  private findReusableAgentMemory(entry: AgentMemoryEntry) {
+    const normalizedTitle = normalizeMemoryText(entry.title);
+    const normalizedSummary = normalizeMemoryText(entry.summary);
+    const normalizedDetails = normalizeMemoryText(entry.details);
+
+    for (const existing of this.loadStoredAgentMemories(entry.employeeName)) {
+      const sameTitle = normalizeMemoryText(existing.title) === normalizedTitle;
+      const sameReference = Boolean(entry.referenceId && existing.referenceId && entry.referenceId === existing.referenceId);
+      if (!sameTitle && !sameReference) {
+        continue;
+      }
+
+      const existingSummary = normalizeMemoryText(existing.summary);
+      const existingDetails = normalizeMemoryText(existing.details);
+      const exactDuplicate = sameTitle && existingSummary === normalizedSummary && existingDetails === normalizedDetails;
+      if (exactDuplicate) {
+        return { mode: 'skip' as const, existing };
+      }
+
+      const summaryOverlap = tokenOverlapRatio(existing.summary, entry.summary);
+      const detailsOverlap = tokenOverlapRatio(existing.details, entry.details);
+      if (sameReference || (sameTitle && (summaryOverlap >= 0.72 || detailsOverlap >= 0.72))) {
+        return { mode: 'update' as const, existing };
+      }
+    }
+
+    return null;
+  }
+
+  appendAgentMemory(entry: AgentMemoryEntry) {
+    this.ensureEmployeeWorkspace(entry.employeeName);
+    const timestamp = new Date().toISOString();
+    const reusable = this.findReusableAgentMemory(entry);
+
+    if (reusable?.mode === 'skip') {
+      return {
+        mode: 'skipped' as const,
+        sourcePath: reusable.existing.sourcePath,
+      };
+    }
+
+    if (reusable?.mode === 'update') {
+      const mergedTags = [...new Set([...(reusable.existing.tags ?? []), ...(entry.tags ?? [])])];
+      const mergedSummary =
+        normalizeMemoryText(reusable.existing.summary) === normalizeMemoryText(entry.summary) ||
+        reusable.existing.summary.length >= entry.summary.length
+          ? reusable.existing.summary
+          : entry.summary;
+      const newDetailBlock = entry.details.trim();
+      const existingDetails = reusable.existing.details.trim();
+      const mergedDetails =
+        normalizeMemoryText(existingDetails).includes(normalizeMemoryText(newDetailBlock)) || newDetailBlock.length === 0
+          ? existingDetails
+          : `${existingDetails}\n\n### Update ${timestamp}\n${newDetailBlock}`;
+      const updatedEntry: AgentMemoryEntry = {
+        ...entry,
+        title: reusable.existing.title,
+        summary: mergedSummary,
+        details: mergedDetails,
+        tags: mergedTags,
+        importance: Math.max(reusable.existing.importance ?? 1, entry.importance ?? 1),
+        referenceId: entry.referenceId ?? reusable.existing.referenceId ?? null,
+        relatedLocationId: entry.relatedLocationId ?? reusable.existing.relatedLocationId ?? null,
+        relatedEmployeeName: entry.relatedEmployeeName ?? reusable.existing.relatedEmployeeName ?? null,
+      };
+      writeText(
+        reusable.existing.sourcePath,
+        this.renderAgentMemoryContent(updatedEntry, {
+          createdAt: reusable.existing.createdAt,
+          updatedAt: timestamp,
+          occurrences: reusable.existing.occurrences + 1,
+        }),
+      );
+      return {
+        mode: 'updated' as const,
+        sourcePath: reusable.existing.sourcePath,
+      };
+    }
+
+    const notePath = join(this.longTermMemoryPath(entry.employeeName), `${timestamp.replace(/[:]/g, '-')}-${slugify(entry.title)}.md`);
+    const content = this.renderAgentMemoryContent(entry, {
+      createdAt: timestamp,
+      updatedAt: null,
+      occurrences: 1,
+    });
     writeText(notePath, content);
+    return {
+      mode: 'created' as const,
+      sourcePath: notePath,
+    };
   }
 
   appendPrivateNote(entry: {
@@ -583,19 +1171,22 @@ export class ObsidianVault {
       const content = readText(path);
       const title = extractTitle(content, basename(path, '.md'));
       const subject = extractField(content, 'Subject') || title;
-      const from = extractField(content, 'From') || 'unknown@example.com';
-      const to = extractField(content, 'To') || 'office@no-mans-ai.local';
+      const fromMailbox = parseMailbox(extractField(content, 'From') || 'unknown@example.com', 'unknown@example.com');
+      const toMailbox = parseMailbox(extractField(content, 'To') || 'office@no-mans-ai.local', 'office@no-mans-ai.local');
       const body = stripMetadata(content);
 
       return {
         id: slugify(`${basename(path, '.md')}-${subject}`),
         title,
         subject,
-        from,
-        to,
+        fromName: fromMailbox.name,
+        from: fromMailbox.email,
+        toName: toMailbox.name,
+        to: toMailbox.email,
         body,
         summary: extractSummary(content),
         sourcePath: path,
+        updatedAt: statSync(path).mtime.toISOString(),
       } satisfies VaultEmail;
     });
   }
@@ -607,19 +1198,22 @@ export class ObsidianVault {
       const content = readText(path);
       const title = extractTitle(content, basename(path, '.md'));
       const subject = extractField(content, 'Subject') || title;
-      const from = extractField(content, 'From') || 'office@no-mans-ai.local';
-      const to = extractField(content, 'To') || 'unknown@example.com';
+      const fromMailbox = parseMailbox(extractField(content, 'From') || 'office@no-mans-ai.local', 'office@no-mans-ai.local');
+      const toMailbox = parseMailbox(extractField(content, 'To') || 'unknown@example.com', 'unknown@example.com');
       const body = stripMetadata(content);
 
       return {
         id: slugify(`${basename(path, '.md')}-${subject}`),
         title,
         subject,
-        from,
-        to,
+        fromName: fromMailbox.name,
+        from: fromMailbox.email,
+        toName: toMailbox.name,
+        to: toMailbox.email,
         body,
         summary: extractSummary(content),
         sourcePath: path,
+        updatedAt: statSync(path).mtime.toISOString(),
       } satisfies VaultEmail;
     });
   }
@@ -629,8 +1223,8 @@ export class ObsidianVault {
     const notePath = join(this.emailSentPath, `${timestamp}-${slugify(entry.subject)}.md`);
     const content = [
       `# ${entry.subject}`,
-      `From: ${entry.from}`,
-      `To: ${entry.to}`,
+      `From: ${formatMailbox(entry.fromName, entry.from)}`,
+      `To: ${formatMailbox(entry.toName, entry.to)}`,
       `Source: ${entry.sentBy}`,
       entry.sourceEmailId ? `Tags: sent, ${entry.sourceEmailId}` : 'Tags: sent',
       '',

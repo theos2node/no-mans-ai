@@ -4,6 +4,7 @@ import http, { type IncomingMessage, type ServerResponse } from 'http';
 
 import {
   createLivePlannerConfig,
+  type ManualEmailPayload,
   OfficeSimulationEngine,
   type DashboardEvent,
   type EmployeeSyncPayload,
@@ -97,6 +98,17 @@ const server = http.createServer(async (request: IncomingMessage, response: Serv
       }
 
       sendJson(response, 200, runtime.syncEmployees(payload));
+    } catch {
+      sendJson(response, 400, { error: 'Invalid JSON payload.' });
+    }
+    return;
+  }
+
+  if (request.method === 'POST' && url === '/api/emails/send') {
+    try {
+      const payload = await readJsonBody<ManualEmailPayload>(request);
+      const result = runtime.sendManualEmail(payload);
+      sendJson(response, result.ok ? 200 : 400, result);
     } catch {
       sendJson(response, 400, { error: 'Invalid JSON payload.' });
     }

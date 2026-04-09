@@ -7,6 +7,7 @@ import {
   type VaultAgentLiveMemory,
   type VaultAgentMemorySummary,
   type VaultKnowledgeSummary,
+  type VaultOfficeSystemRecord,
 } from './obsidianVault.ts';
 
 export type RunState = 'idle' | 'running' | 'paused';
@@ -40,7 +41,7 @@ export type OfficeLocationId =
 export type Department = 'react' | 'service' | 'finance' | 'quality' | 'management' | 'it';
 export type EmployeePhase = 'idle' | 'moving' | 'working' | 'waiting' | 'paused';
 export type PlannerTransport = 'local' | 'direct' | 'proxy';
-export type PlanSource = 'default' | 'live' | 'request' | 'test' | 'support';
+export type PlanSource = 'default' | 'live' | 'request' | 'test' | 'support' | 'workflow';
 export type MemoryTier = 'active' | 'passive';
 export type MemoryKind = 'task' | 'review' | 'approval' | 'escalation' | 'correction' | 'context';
 export type OfficeActionType =
@@ -163,6 +164,9 @@ export interface OfficeRequest {
   createdAt: string;
   updatedAt: string;
   decisionSummary: string | null;
+  readAt: string | null;
+  replyingAt: string | null;
+  replyReadAt: string | null;
 }
 
 export interface OfficeRequestSummary {
@@ -197,6 +201,7 @@ interface OfficeAction {
   requestKind: OfficeRequestKind | null;
   requestId: string | null;
   notes: string | null;
+  requiresApproval: boolean;
   durationTicks: number;
   ticksWorked: number;
 }
@@ -207,7 +212,18 @@ interface TaskPlan {
   objective: string;
   source: PlanSource;
   createdAt: string;
+  officeRecordId?: string | null;
   actions: OfficeAction[];
+}
+
+interface OfficeRecordActivity {
+  recordId: string;
+  title: string;
+  completedCount: number;
+  lastAssignedAt: string | null;
+  lastCompletedAt: string | null;
+  lastOwnerId: EmployeeId | null;
+  cooldownUntil: string | null;
 }
 
 export interface LivePlannerConfig {
@@ -293,6 +309,9 @@ interface EmployeeRuntimeRecord extends EmployeeSeed {
   memoryNoteCount: number;
   currentEmail: VaultEmail | null;
   draftedEmailBody: string | null;
+  emailWorkflow: EmailWorkflowState | null;
+  requestWorkflow: RequestWorkflowState | null;
+  workflowHabits: EmployeeWorkflowHabits;
   activeMemory: MemoryItem[];
   passiveMemory: MemoryItem[];
   performance: PerformanceStats;
@@ -341,6 +360,15 @@ export interface EmployeeSnapshot {
     inboxCount: number;
     sentCount: number;
     pendingSubjects: string[];
+    inbox: VaultEmail[];
+    sent: VaultEmail[];
+  };
+  officeSystems: {
+    backlog: VaultOfficeSystemRecord[];
+    clients: VaultOfficeSystemRecord[];
+    projects: VaultOfficeSystemRecord[];
+    finance: VaultOfficeSystemRecord[];
+    notes: VaultOfficeSystemRecord[];
   };
   summary: {
     pendingRequests: number;
@@ -359,16 +387,31 @@ export interface EmployeeSyncPayload {
   employees: EmployeeSyncEntry[];
 }
 
+export interface ManualEmailPayload {
+  employeeId: EmployeeId | null;
+  fromName: string;
+  from: string;
+  toName: string;
+  to: string;
+  subject: string;
+  body: string;
+}
+
 interface PersistedEmployeeState {
   activeMemory: MemoryItem[];
   passiveMemory: MemoryItem[];
   performance: PerformanceStats;
+  emailWorkflow?: EmailWorkflowState | null;
+  requestWorkflow?: RequestWorkflowState | null;
+  workflowHabits?: EmployeeWorkflowHabits | null;
 }
 
 interface PersistedOfficeState {
   version: number;
   employees: Partial<Record<EmployeeId, PersistedEmployeeState>>;
   processedEmailIds?: string[];
+  requests?: OfficeRequest[];
+  officeRecordActivity?: OfficeRecordActivity[];
 }
 
 const ENGINE_TICK_MS = 800;
@@ -385,7 +428,7 @@ const PLANNER_CIRCUIT_BREAKER_COOLDOWN_MS = Number(process.env.PLANNER_CIRCUIT_B
 const ACTIVE_MEMORY_LIMIT = 4;
 const PASSIVE_MEMORY_LIMIT = 24;
 const MEMORY_CONSOLIDATION_INTERVAL = 12;
-const PERSISTED_STATE_VERSION = 2;
+const PERSISTED_STATE_VERSION = 5;
 const RUNTIME_STATE_FILE = new URL('../../data/office-runtime.json', import.meta.url);
 const PROXY_SAFE_MODELS = new Set(['gpt-5.4', 'gpt-5.3']);
 
@@ -499,8 +542,10 @@ const defaultPlaybookRules: PlaybookRule[] = [
 
 const TEMP_ACTIVE_EMPLOYEE_IDS: EmployeeId[] = ['sam', 'jeremy'];
 const REDUCED_ROSTER_TEST_MODE = true;
+const PLAN_INTERRUPT_GRACE_MS = 12_000;
 const REDUCED_ROSTER_NOTE =
   'All other staff are missing and status is unknown. Only Sam and Jeremy are currently in the office, and they may cover any role or location as needed.';
+const LOCAL_SPROUT_MODEL = process.env.LOCAL_SPROUT_MODEL?.trim() || 'gemma4:e4b';
 
 const allEmployeeSeeds: EmployeeSeed[] = [
   {
@@ -510,7 +555,7 @@ const allEmployeeSeeds: EmployeeSeed[] = [
     department: 'react',
     assignedLocationId: 'react-c',
     supervisorId: null,
-    preferredModel: 'gpt-4o-mini',
+    preferredModel: LOCAL_SPROUT_MODEL,
     bio: 'Steady and patient, Sam keeps the front-end work calm and organized.',
     defaultTaskTitle: 'React C',
     defaultChecklist: ['Check queue', 'Review task board', 'Pair on front-end fix'],
@@ -522,7 +567,7 @@ const allEmployeeSeeds: EmployeeSeed[] = [
     department: 'react',
     assignedLocationId: 'react-d',
     supervisorId: null,
-    preferredModel: 'gpt-4o-mini',
+    preferredModel: LOCAL_SPROUT_MODEL,
     bio: 'Direct and reliable, Jeremy likes quick fixes that remove blockers fast.',
     defaultTaskTitle: 'React D',
     defaultChecklist: ['Check queue', 'Review blocker list', 'Pair on UI pass'],
@@ -875,6 +920,47 @@ function clonePerformance(performance: PerformanceStats): PerformanceStats {
   return { ...performance };
 }
 
+function cloneOfficeRequest(request: OfficeRequest): OfficeRequest {
+  return { ...request };
+}
+
+function cloneEmailWorkflowState(workflow: EmailWorkflowState): EmailWorkflowState {
+  return {
+    ...workflow,
+    helpers: workflow.helpers.map((helper) => ({ ...helper })),
+  };
+}
+
+function cloneRequestWorkflowState(workflow: RequestWorkflowState): RequestWorkflowState {
+  return { ...workflow };
+}
+
+function createWorkflowHabits(): EmployeeWorkflowHabits {
+  return {
+    collaborators: [],
+    emailPatterns: [],
+    recentTaskHistory: [],
+    reflections: [],
+  };
+}
+
+function cloneWorkflowHabits(habits: EmployeeWorkflowHabits): EmployeeWorkflowHabits {
+  return {
+    collaborators: habits.collaborators.map((collaborator) => ({
+      ...collaborator,
+      requestKinds: [...collaborator.requestKinds],
+    })),
+    emailPatterns: habits.emailPatterns.map((pattern) => ({
+      ...pattern,
+      helperUsage: pattern.helperUsage.map((usage) => ({ ...usage })),
+      preferredHelpers: [...pattern.preferredHelpers],
+      categoryTags: [...pattern.categoryTags],
+    })),
+    recentTaskHistory: habits.recentTaskHistory.map((entry) => ({ ...entry })),
+    reflections: habits.reflections.map((entry) => ({ ...entry, tags: [...entry.tags] })),
+  };
+}
+
 function buildAction(
   type: OfficeActionType,
   locationId: OfficeLocationId,
@@ -883,6 +969,7 @@ function buildAction(
     counterpartId?: EmployeeId | null;
     requestKind?: OfficeRequestKind | null;
     notes?: string | null;
+    requiresApproval?: boolean;
     durationTicks?: number;
   },
 ): OfficeAction {
@@ -896,12 +983,13 @@ function buildAction(
     requestKind: options?.requestKind ?? null,
     requestId: null,
     notes: options?.notes ?? null,
+    requiresApproval: options?.requiresApproval ?? true,
     durationTicks: options?.durationTicks ?? durationForAction(type),
     ticksWorked: 0,
   };
 }
 
-function buildPlan(title: string, objective: string, actions: OfficeAction[], source: PlanSource): TaskPlan {
+function buildPlan(title: string, objective: string, actions: OfficeAction[], source: PlanSource, officeRecordId: string | null = null): TaskPlan {
   return {
     id: randomUUID(),
     title,
@@ -909,6 +997,7 @@ function buildPlan(title: string, objective: string, actions: OfficeAction[], so
     actions,
     source,
     createdAt: nowIso(),
+    officeRecordId,
   };
 }
 
@@ -968,6 +1057,9 @@ function createEmployeeState(seed: EmployeeSeed): EmployeeRuntimeRecord {
     memoryNoteCount: 0,
     currentEmail: null,
     draftedEmailBody: null,
+    emailWorkflow: null,
+    requestWorkflow: null,
+    workflowHabits: createWorkflowHabits(),
     activeMemory: [
       createMemoryItem('context', `${seed.name} is assigned to ${seed.position}.`, {
         relatedLocationId: seed.assignedLocationId,
@@ -1349,6 +1441,96 @@ interface EmailHandlingStrategy {
   ownerEscalationLikely: boolean;
   helpers: EmailHelperPlan[];
   draftFocus: string | null;
+  categoryTags: string[];
+}
+
+interface EmailWorkflowHelperState extends EmailHelperPlan {
+  requestId: string | null;
+  completed: boolean;
+}
+
+interface EmailWorkflowState {
+  emailId: string;
+  subject: string;
+  complexity: 'simple' | 'complex';
+  archiveResearch: boolean;
+  gmApprovalRequired: boolean;
+  ownerEscalationLikely: boolean;
+  draftFocus: string | null;
+  categoryTags: string[];
+  deskNotesRead: boolean;
+  emailReviewed: boolean;
+  archivesReviewed: boolean;
+  drafted: boolean;
+  sent: boolean;
+  archived: boolean;
+  approvalRequestId: string | null;
+  approvalResolved: boolean;
+  helpers: EmailWorkflowHelperState[];
+}
+
+interface RequestWorkflowState {
+  requestId: string;
+  title: string;
+  kind: OfficeRequestKind;
+  locationId: OfficeLocationId;
+  needsArchives: boolean;
+  deskNotesRead: boolean;
+  contextReviewed: boolean;
+  archivesReviewed: boolean;
+  investigationDone: boolean;
+  resolved: boolean;
+  reportedBack: boolean;
+  archived: boolean;
+}
+
+interface EmailHelperUsage {
+  employeeId: EmployeeId;
+  count: number;
+}
+
+interface CollaboratorHabit {
+  employeeId: EmployeeId;
+  helpfulCount: number;
+  stalledCount: number;
+  lastWorkedAt: string | null;
+  requestKinds: OfficeRequestKind[];
+}
+
+interface EmailPatternHabit {
+  key: string;
+  label: string;
+  timesUsed: number;
+  soloCount: number;
+  collaborativeCount: number;
+  helperUsage: EmailHelperUsage[];
+  preferredHelpers: EmployeeId[];
+  archiveResearch: boolean;
+  gmApprovalRequired: boolean;
+  categoryTags: string[];
+  lastReflection: string;
+  lastUpdatedAt: string;
+}
+
+interface TaskHistoryEntry {
+  title: string;
+  source: string;
+  completedAt: string;
+}
+
+interface WorkflowReflectionEntry {
+  id: string;
+  createdAt: string;
+  title: string;
+  summary: string;
+  tags: string[];
+}
+
+interface EmployeeWorkflowHabits {
+  collaborators: CollaboratorHabit[];
+  emailPatterns: EmailPatternHabit[];
+  recentTaskHistory: TaskHistoryEntry[];
+  reflections: WorkflowReflectionEntry[];
 }
 
 function emailHelperPlanFor(employeeId: EmployeeId): EmailHelperPlan | null {
@@ -1431,6 +1613,16 @@ function classifyInboxEmail(email: VaultEmail): EmailHandlingStrategy {
   const categoryCount = [finance, infrastructure, technical, quality].filter(Boolean).length;
   const complexity: 'simple' | 'complex' =
     moneyOrPolicy || repeatPattern || timeSensitive || categoryCount > 1 ? 'complex' : 'simple';
+  const ownerEscalationLikely = /lawsuit|fraud|legal|chargeback|threat|press|owner decision|human judgment/.test(haystack);
+  const categoryTags = [
+    finance ? 'finance' : null,
+    infrastructure ? 'infrastructure' : null,
+    technical ? 'technical' : null,
+    quality ? 'quality' : null,
+    timeSensitive ? 'time-sensitive' : null,
+    moneyOrPolicy ? 'policy' : null,
+    repeatPattern ? 'repeat' : null,
+  ].filter((tag): tag is string => Boolean(tag));
 
   const helperIds: EmployeeId[] = [];
 
@@ -1457,15 +1649,94 @@ function classifyInboxEmail(email: VaultEmail): EmailHandlingStrategy {
   return {
     complexity,
     archiveResearch,
-    gmApprovalRequired: true,
-    ownerEscalationLikely: /lawsuit|fraud|legal|chargeback|threat|press|owner decision|human judgment/.test(haystack),
+    gmApprovalRequired: complexity === 'complex' || ownerEscalationLikely,
+    ownerEscalationLikely,
     helpers: dedupeEmailHelpers(helperIds.map((employeeId) => emailHelperPlanFor(employeeId))),
     draftFocus: finance
       ? 'Be clear about what was verified, whether policy allows the refund, and that final confirmation follows GM sign-off.'
       : technical
         ? 'Acknowledge the issue, summarize what was checked, and state the next concrete step.'
         : null,
+    categoryTags: categoryTags.length > 0 ? categoryTags : ['general'],
   };
+}
+
+function requestNeedsArchives(request: OfficeRequest) {
+  return /policy|playbook|history|repeat|again|recurring|vip|duplicate|refund|credit|discount|waive|chargeback|legal|fraud/i.test(
+    `${request.title}\n${request.details}`,
+  );
+}
+
+function createEmailWorkflowState(email: VaultEmail, strategy: EmailHandlingStrategy): EmailWorkflowState {
+  return {
+    emailId: email.id,
+    subject: email.subject,
+    complexity: strategy.complexity,
+    archiveResearch: strategy.archiveResearch,
+    gmApprovalRequired: strategy.gmApprovalRequired,
+    ownerEscalationLikely: strategy.ownerEscalationLikely,
+    draftFocus: strategy.draftFocus,
+    categoryTags: [...strategy.categoryTags],
+    deskNotesRead: false,
+    emailReviewed: false,
+    archivesReviewed: false,
+    drafted: false,
+    sent: false,
+    archived: false,
+    approvalRequestId: null,
+    approvalResolved: false,
+    helpers: strategy.helpers.map((helper) => ({
+      ...helper,
+      requestId: null,
+      completed: false,
+    })),
+  };
+}
+
+function createRequestWorkflowState(request: OfficeRequest): RequestWorkflowState {
+  return {
+    requestId: request.id,
+    title: request.title,
+    kind: request.kind,
+    locationId: request.locationId,
+    needsArchives: requestNeedsArchives(request),
+    deskNotesRead: false,
+    contextReviewed: false,
+    archivesReviewed: false,
+    investigationDone: false,
+    resolved: false,
+    reportedBack: false,
+    archived: false,
+  };
+}
+
+function emailWorkflowTitle(workflow: EmailWorkflowState) {
+  return `Inbox: ${workflow.subject}`;
+}
+
+function emailWorkflowObjective(employee: EmployeeRuntimeRecord, workflow: EmailWorkflowState) {
+  return workflow.complexity === 'complex'
+    ? `${employee.position} is working the inbox one step at a time with visible collaboration.`
+    : `${employee.position} is closing a straightforward inbox email one step at a time.`;
+}
+
+function emailPatternKey(strategy: Pick<EmailHandlingStrategy, 'complexity' | 'archiveResearch' | 'gmApprovalRequired' | 'categoryTags'>) {
+  const categories = [...strategy.categoryTags].sort().join('+') || 'general';
+  return `email:${strategy.complexity}:${categories}:${strategy.archiveResearch ? 'archives' : 'desk'}:${strategy.gmApprovalRequired ? 'approval' : 'direct'}`;
+}
+
+function emailPatternLabel(strategy: Pick<EmailHandlingStrategy, 'complexity' | 'categoryTags'>) {
+  const categories = strategy.categoryTags.length > 0 ? strategy.categoryTags.join(', ') : 'general';
+  return `${strategy.complexity} email workflow (${categories})`;
+}
+
+function requestWorkflowTitle(request: OfficeRequest) {
+  return `${humanizeActionLabel(request.kind)}: ${request.title}`;
+}
+
+function requestWorkflowObjective(employee: EmployeeRuntimeRecord, request: OfficeRequest) {
+  const requesterName = employeeSeeds.find((seed) => seed.id === request.fromId)?.name ?? request.fromId;
+  return `${employee.position} is resolving ${request.title.toLowerCase()} for ${requesterName} one step at a time.`;
 }
 
 function buildEmailHandlingPlan(employee: EmployeeRuntimeRecord, email: VaultEmail, strategy?: EmailHandlingStrategy): TaskPlan {
@@ -1511,6 +1782,7 @@ function buildEmailHandlingPlan(employee: EmployeeRuntimeRecord, email: VaultEma
   actions.push(
     buildAction('send_email', employee.assignedLocationId, `Send reply to ${email.from}`, {
       notes: email.id,
+      requiresApproval: classification.gmApprovalRequired,
     }),
   );
   actions.push(
@@ -1523,7 +1795,7 @@ function buildEmailHandlingPlan(employee: EmployeeRuntimeRecord, email: VaultEma
     `Inbox: ${email.subject}`,
     classification.complexity === 'complex'
       ? `${employee.position} is triaging a complex incoming email, consulting the right people, stitching the findings together, getting General Manager approval, and archiving the final result.${classification.draftFocus ? ` Draft focus: ${classification.draftFocus}` : ''}`
-      : `${employee.position} is triaging an incoming email, handling the work directly, getting General Manager approval for the final send, and archiving the final result.${classification.draftFocus ? ` Draft focus: ${classification.draftFocus}` : ''}`,
+      : `${employee.position} is triaging a straightforward incoming email, handling it directly, sending the response, and archiving the final result.${classification.draftFocus ? ` Draft focus: ${classification.draftFocus}` : ''}`,
     actions,
     'live',
   );
@@ -1582,6 +1854,98 @@ function buildSupportPlan(employee: EmployeeRuntimeRecord): TaskPlan {
     ],
     'support',
   );
+}
+
+function locationForOfficeRecord(record: VaultOfficeSystemRecord, employee: EmployeeRuntimeRecord): OfficeLocationId {
+  const normalized = normalizeOfficeLocationId(record.locationId);
+  if (normalized) {
+    return normalized;
+  }
+
+  switch (record.lane) {
+    case 'service':
+      return 'customer-relations';
+    case 'finance':
+      return 'coordinator';
+    case 'implementation':
+      return employee.assignedLocationId;
+    case 'it':
+      return 'it-support';
+    case 'operations':
+    default:
+      return 'war-room';
+  }
+}
+
+function counterpartForOfficeRecord(employee: EmployeeRuntimeRecord, record: VaultOfficeSystemRecord) {
+  const collaboratorId = fallbackCoverageCounterpart(employee.id);
+  if (!collaboratorId || collaboratorId === employee.id) {
+    return null;
+  }
+
+  if (record.priority === 'high' || record.status === 'review' || record.tags.includes('review')) {
+    return collaboratorId;
+  }
+
+  if (record.kind === 'project' || record.kind === 'backlog') {
+    return collaboratorId;
+  }
+
+  return null;
+}
+
+function buildPlanFromOfficeRecord(employee: EmployeeRuntimeRecord, record: VaultOfficeSystemRecord): TaskPlan {
+  const focusLocation = locationForOfficeRecord(record, employee);
+  const counterpartId = counterpartForOfficeRecord(employee, record);
+  const actions: OfficeAction[] = [buildAction('read_private_notes', employee.assignedLocationId, 'Refresh desk memory against live checklist')];
+
+  if (record.kind === 'internal_note') {
+    actions.push(buildAction('read_archives', 'archives', `Review ${record.title.toLowerCase()}`));
+    actions.push(buildAction('fetch_context', focusLocation, `Summarize the active office need behind ${record.title.toLowerCase()}`));
+    actions.push(buildAction('archive_note', 'archives', `Archive updates for ${record.title.toLowerCase()}`));
+    return buildPlan(record.title, record.summary, actions, 'default', record.id);
+  }
+
+  actions.push(buildAction('fetch_context', focusLocation, `Open ${record.title.toLowerCase()}`));
+
+  if (record.kind === 'client') {
+    actions.push(buildAction('investigate', focusLocation, `Review client packet for ${record.title}`));
+    if (counterpartId) {
+      actions.push(
+        buildAction('second_opinion', employeeSeedMap.get(counterpartId)?.assignedLocationId ?? 'war-room', `Get client read on ${record.title}`, {
+          counterpartId,
+          requestKind: 'second_opinion',
+        }),
+      );
+    }
+    actions.push(buildAction('report_back', 'war-room', `Log next customer step for ${record.title}`, { counterpartId }));
+  } else if (record.kind === 'finance') {
+    actions.push(buildAction('investigate', focusLocation, `Investigate financial packet for ${record.title}`));
+    if (counterpartId) {
+      actions.push(
+        buildAction('request_review', 'war-room', `Review finance decision for ${record.title}`, {
+          counterpartId,
+          requestKind: 'review',
+        }),
+      );
+    }
+    actions.push(buildAction('archive_note', 'archives', `Archive finance packet for ${record.title}`));
+    return buildPlan(record.title, record.summary, actions, 'default', record.id);
+  } else {
+    actions.push(buildAction('desk_work', focusLocation, `Advance ${record.title.toLowerCase()}`));
+    if (counterpartId) {
+      actions.push(
+        buildAction('request_review', 'war-room', `Review ${record.title.toLowerCase()} direction`, {
+          counterpartId,
+          requestKind: 'review',
+        }),
+      );
+    }
+    actions.push(buildAction('report_back', 'war-room', `Pitch next move for ${record.title}`, { counterpartId }));
+  }
+
+  actions.push(buildAction('archive_note', 'archives', `Archive notes for ${record.title}`));
+  return buildPlan(record.title, record.summary, actions, 'default', record.id);
 }
 
 function buildReducedRosterLeadershipPlan(seed: EmployeeRuntimeRecord): TaskPlan {
@@ -1914,13 +2278,21 @@ function applyPlaybookGuardrails(employee: EmployeeRuntimeRecord, plan: TaskPlan
     return normalized;
   });
 
+  if (plan.source === 'workflow') {
+    return {
+      ...plan,
+      actions,
+    };
+  }
+
   if (!actions.some((action) => action.type === 'archive_note')) {
     actions.push(buildAction('archive_note', 'archives', 'Archive operational notes'));
   }
 
   const sendEmailIndex = actions.findIndex((action) => action.type === 'send_email');
   const hasApproval = actions.some((action) => action.type === 'ask_permission');
-  if (sendEmailIndex !== -1 && approvalCounterpart && !hasApproval) {
+  const sendEmailAction = sendEmailIndex === -1 ? null : actions[sendEmailIndex];
+  if (sendEmailIndex !== -1 && sendEmailAction?.requiresApproval !== false && approvalCounterpart && !hasApproval) {
     actions.splice(
       sendEmailIndex,
       0,
@@ -1964,6 +2336,12 @@ export class OfficeSimulationEngine {
   private logs: LogEntry[] = [];
   private playbookRules: PlaybookRule[] = defaultPlaybookRules.map((rule) => ({ ...rule }));
   private knowledgeSummaries: VaultKnowledgeSummary[] = [];
+  private officeBacklog: VaultOfficeSystemRecord[] = [];
+  private officeClients: VaultOfficeSystemRecord[] = [];
+  private officeProjects: VaultOfficeSystemRecord[] = [];
+  private officeFinance: VaultOfficeSystemRecord[] = [];
+  private officeNotes: VaultOfficeSystemRecord[] = [];
+  private readonly officeRecordActivity = new Map<string, OfficeRecordActivity>();
   private readonly repetitionCounts = new Map<string, number>();
   private readonly processedEmailIds = new Set<string>();
   private plannerQueue: EmployeeId[] = [];
@@ -2024,6 +2402,7 @@ export class OfficeSimulationEngine {
     const inboxEmails = this.pendingInboxEmails();
     const sentEmails = this.vault.loadSentEmails();
     const employees = [...this.employees.values()].map((employee) => {
+      this.syncWorkflowRuntimeContext(employee);
       const currentAction = this.currentAction(employee);
       return {
         id: employee.id,
@@ -2042,7 +2421,7 @@ export class OfficeSimulationEngine {
         status: employee.status,
         taskTitle: employee.taskTitle,
         objective: employee.objective,
-        checklist: serializeChecklist(employee.currentPlan),
+        checklist: this.workflowChecklist(employee),
         scriptQueue: this.remainingLocationQueue(employee),
         planVersion: employee.planVersion,
         lastUpdatedAt: employee.lastUpdatedAt,
@@ -2082,6 +2461,15 @@ export class OfficeSimulationEngine {
         inboxCount: inboxEmails.length,
         sentCount: sentEmails.length,
         pendingSubjects: inboxEmails.map((email) => email.subject).slice(0, 5),
+        inbox: inboxEmails.map((email) => ({ ...email })),
+        sent: sentEmails.map((email) => ({ ...email })),
+      },
+      officeSystems: {
+        backlog: this.officeBacklog.map((record) => ({ ...record, checklist: [...record.checklist], tags: [...record.tags] })),
+        clients: this.officeClients.map((record) => ({ ...record, checklist: [...record.checklist], tags: [...record.tags] })),
+        projects: this.officeProjects.map((record) => ({ ...record, checklist: [...record.checklist], tags: [...record.tags] })),
+        finance: this.officeFinance.map((record) => ({ ...record, checklist: [...record.checklist], tags: [...record.tags] })),
+        notes: this.officeNotes.map((record) => ({ ...record, checklist: [...record.checklist], tags: [...record.tags] })),
       },
       summary: {
         pendingRequests: [...this.requests.values()].filter((request) => request.status === 'pending').length,
@@ -2090,6 +2478,42 @@ export class OfficeSimulationEngine {
         employeesWaiting: employees.filter((employee) => employee.phase === 'waiting' || employee.planning).length,
       },
     };
+  }
+
+  sendManualEmail(payload: ManualEmailPayload) {
+    const subject = payload.subject.trim();
+    const body = payload.body.trim();
+    const fromName = payload.fromName.trim();
+    const from = payload.from.trim();
+    const toName = payload.toName.trim();
+    const to = payload.to.trim();
+
+    if (!subject || !body || !fromName || !from || !toName || !to) {
+      return { ok: false as const, error: 'From, to, subject, and content are required.' };
+    }
+
+    this.vault.appendSentEmail({
+      subject,
+      toName,
+      to,
+      fromName,
+      from,
+      body,
+      sentBy: payload.employeeId ? `${payload.employeeId} desk pc` : 'desk pc',
+      sourceEmailId: null,
+    });
+
+    if (payload.employeeId) {
+      const employee = this.employees.get(payload.employeeId);
+      if (employee) {
+        employee.lastUpdatedAt = nowIso();
+        this.logAgentEvent(employee, 'Desk PC Email Sent', `Sent "${subject}" to ${to}.`);
+      }
+    }
+
+    this.persistState();
+    this.broadcast({ type: 'employees', payload: this.getEmployeeSnapshot() });
+    return { ok: true as const };
   }
 
   start(): { ok: boolean; error?: string } {
@@ -2193,6 +2617,7 @@ export class OfficeSimulationEngine {
     this.requests.clear();
     this.terminalItems.clear();
     this.repetitionCounts.clear();
+    this.officeRecordActivity.clear();
     this.processedEmailIds.clear();
     this.plannerQueue = [];
     this.plannerBusy = false;
@@ -2304,12 +2729,35 @@ export class OfficeSimulationEngine {
         ? persistedEmployee.passiveMemory.map(cloneMemoryItem).slice(-PASSIVE_MEMORY_LIMIT)
         : employee.passiveMemory;
       employee.performance = persistedEmployee.performance ? clonePerformance(persistedEmployee.performance) : employee.performance;
+      employee.emailWorkflow = persistedEmployee.emailWorkflow ? cloneEmailWorkflowState(persistedEmployee.emailWorkflow) : null;
+      employee.requestWorkflow = persistedEmployee.requestWorkflow ? cloneRequestWorkflowState(persistedEmployee.requestWorkflow) : null;
+      employee.workflowHabits = persistedEmployee.workflowHabits ? cloneWorkflowHabits(persistedEmployee.workflowHabits) : createWorkflowHabits();
     }
 
     for (const emailId of persisted.processedEmailIds ?? []) {
       if (typeof emailId === 'string' && emailId) {
         this.processedEmailIds.add(emailId);
       }
+    }
+
+    for (const request of persisted.requests ?? []) {
+      if (!request || typeof request.id !== 'string' || !request.id) {
+        continue;
+      }
+
+      this.requests.set(request.id, cloneOfficeRequest(request));
+    }
+
+    this.officeRecordActivity.clear();
+    for (const activity of persisted.officeRecordActivity ?? []) {
+      if (!activity || typeof activity.recordId !== 'string' || !activity.recordId) {
+        continue;
+      }
+      this.officeRecordActivity.set(activity.recordId, { ...activity });
+    }
+
+    for (const employee of this.employees.values()) {
+      this.syncWorkflowRuntimeContext(employee);
     }
   }
 
@@ -2319,6 +2767,8 @@ export class OfficeSimulationEngine {
       version: PERSISTED_STATE_VERSION,
       employees: {},
       processedEmailIds: [...this.processedEmailIds],
+      requests: [...this.requests.values()].map(cloneOfficeRequest),
+      officeRecordActivity: [...this.officeRecordActivity.values()].map((activity) => ({ ...activity })),
     };
 
     for (const employee of this.employees.values()) {
@@ -2326,6 +2776,9 @@ export class OfficeSimulationEngine {
         activeMemory: employee.activeMemory.map(cloneMemoryItem),
         passiveMemory: employee.passiveMemory.map(cloneMemoryItem),
         performance: clonePerformance(employee.performance),
+        emailWorkflow: employee.emailWorkflow ? cloneEmailWorkflowState(employee.emailWorkflow) : null,
+        requestWorkflow: employee.requestWorkflow ? cloneRequestWorkflowState(employee.requestWorkflow) : null,
+        workflowHabits: cloneWorkflowHabits(employee.workflowHabits),
       };
     }
 
@@ -2340,12 +2793,18 @@ export class OfficeSimulationEngine {
     }));
     this.playbookRules = vaultRules.length > 0 ? vaultRules : defaultPlaybookRules.map((rule) => ({ ...rule }));
     this.knowledgeSummaries = this.vault.loadKnowledgeSummaries();
+    this.officeBacklog = this.vault.loadOfficeSystemRecords('backlog');
+    this.officeClients = this.vault.loadOfficeSystemRecords('client');
+    this.officeProjects = this.vault.loadOfficeSystemRecords('project');
+    this.officeFinance = this.vault.loadOfficeSystemRecords('finance');
+    this.officeNotes = this.vault.loadOfficeSystemRecords('internal_note');
     for (const employee of this.employees.values()) {
       this.refreshEmployeeMemoryWorkspace(employee);
     }
   }
 
   private buildAgentMemoryQuery(employee: EmployeeRuntimeRecord) {
+    this.syncWorkflowRuntimeContext(employee);
     const queryParts = [employee.taskTitle, employee.objective];
     const pendingRequest = this.nextPendingRequestFor(employee.id);
     if (pendingRequest) {
@@ -2358,15 +2817,160 @@ export class OfficeSimulationEngine {
   }
 
   private refreshEmployeeMemoryWorkspace(employee: EmployeeRuntimeRecord) {
+    this.syncWorkflowRuntimeContext(employee);
     const query = this.buildAgentMemoryQuery(employee);
     employee.privateNotes = this.vault.searchAgentMemories(employee.name, query, 5);
     employee.liveMemory = this.vault.loadAgentLiveMemory(employee.name);
     employee.memoryNoteCount = this.vault.countAgentMemories(employee.name);
   }
 
-  private syncLiveMemory(employee: EmployeeRuntimeRecord) {
-    const checklist = serializeChecklist(employee.currentPlan).slice(0, 5);
-    const openLoops = [
+  private workflowChecklist(employee: EmployeeRuntimeRecord) {
+    if (employee.requestWorkflow) {
+      return this.requestWorkflowChecklist(employee, employee.requestWorkflow);
+    }
+
+    if (employee.emailWorkflow) {
+      return this.emailWorkflowChecklist(employee, employee.emailWorkflow);
+    }
+
+    return serializeChecklist(employee.currentPlan).slice(0, 5);
+  }
+
+  private normalizeEmailWorkflowHelpers(employee: EmployeeRuntimeRecord, workflow: EmailWorkflowState) {
+    for (const helper of workflow.helpers) {
+      if (helper.employeeId !== employee.id) {
+        continue;
+      }
+
+      const fallbackId = defaultSecondOpinionCounterpart(employee) ?? helper.employeeId;
+      const fallbackSeed = employeeSeedMap.get(fallbackId);
+      helper.employeeId = fallbackId;
+      helper.locationId = fallbackSeed?.assignedLocationId ?? helper.locationId;
+    }
+  }
+
+  private syncWorkflowRuntimeContext(employee: EmployeeRuntimeRecord) {
+    if (employee.emailWorkflow) {
+      const workflow = employee.emailWorkflow;
+      this.normalizeEmailWorkflowHelpers(employee, workflow);
+      const email = this.resolveInboxEmail(workflow.emailId);
+
+      employee.taskTitle = emailWorkflowTitle(workflow);
+      employee.objective = emailWorkflowObjective(employee, workflow);
+
+      if (email) {
+        if (workflow.emailReviewed && !workflow.sent) {
+          employee.currentEmail = email;
+        } else if (!workflow.emailReviewed) {
+          employee.currentEmail = null;
+        }
+
+        if (workflow.drafted && !workflow.sent) {
+          employee.draftedEmailBody = this.composeEmailDraft(employee, email);
+        } else if (!workflow.drafted || workflow.sent) {
+          employee.draftedEmailBody = null;
+        }
+      } else if (!workflow.sent) {
+        employee.emailWorkflow = null;
+        employee.currentEmail = null;
+        employee.draftedEmailBody = null;
+      } else {
+        employee.currentEmail = null;
+        employee.draftedEmailBody = null;
+      }
+    } else {
+      employee.currentEmail = null;
+      employee.draftedEmailBody = null;
+    }
+
+    if (employee.requestWorkflow) {
+      const request = this.requests.get(employee.requestWorkflow.requestId);
+      if (request) {
+        employee.taskTitle = requestWorkflowTitle(request);
+        employee.objective = requestWorkflowObjective(employee, request);
+      } else {
+        employee.requestWorkflow = null;
+      }
+    }
+
+    if (!employee.requestWorkflow && !employee.emailWorkflow && !employee.currentPlan) {
+      employee.taskTitle = employee.defaultTaskTitle;
+      employee.objective = `${employee.position} is keeping the office moving inside playbook rules.`;
+    }
+  }
+
+  private emailWorkflowChecklist(employee: EmployeeRuntimeRecord, workflow: EmailWorkflowState) {
+    const helperLabels = workflow.helpers.map((helper) => {
+      const counterpartName = this.employees.get(helper.employeeId)?.name ?? helper.employeeId;
+      const status = helper.completed ? 'done' : helper.requestId ? 'waiting' : 'pending';
+      const marker = status === 'done' ? '[x]' : status === 'waiting' ? '[~]' : '[ ]';
+      return `${marker} Consult ${counterpartName} on ${workflow.subject}`;
+    });
+    const approvalStatus = workflow.gmApprovalRequired
+      ? workflow.approvalResolved
+        ? '[x]'
+        : workflow.approvalRequestId
+          ? '[~]'
+          : '[ ]'
+      : null;
+
+    return [
+      `${workflow.deskNotesRead ? '[x]' : '[ ]'} Review desk notes and prior drafts`,
+      `${workflow.emailReviewed ? '[x]' : '[ ]'} Review inbox email: ${workflow.subject}`,
+      ...(workflow.archiveResearch ? [`${workflow.archivesReviewed ? '[x]' : '[ ]'} Check archives and playbook for ${workflow.subject}`] : []),
+      ...helperLabels,
+      `${workflow.drafted ? '[x]' : '[ ]'} Draft reply`,
+      ...(approvalStatus ? [`${approvalStatus} Request approval for ${workflow.subject}`] : []),
+      `${workflow.sent ? '[x]' : '[ ]'} Send reply`,
+      `${workflow.archived ? '[x]' : '[ ]'} Archive email resolution for ${workflow.subject}`,
+    ].slice(0, 8);
+  }
+
+  private requestWorkflowChecklist(employee: EmployeeRuntimeRecord, workflow: RequestWorkflowState) {
+    const request = this.requests.get(workflow.requestId);
+    const requesterName = request ? this.employees.get(request.fromId)?.name ?? request.fromId : 'requester';
+    const requestLabel = request?.kind ?? workflow.kind;
+    return [
+      `${workflow.deskNotesRead ? '[x]' : '[ ]'} Refresh personal memory`,
+      `${workflow.contextReviewed ? '[x]' : '[ ]'} Review ${requestLabel.replace('_', ' ')} context`,
+      ...(workflow.needsArchives ? [`${workflow.archivesReviewed ? '[x]' : '[ ]'} Check archives and playbook for ${workflow.title.toLowerCase()}`] : []),
+      `${workflow.investigationDone ? '[x]' : '[ ]'} Inspect ${workflow.title.toLowerCase()}`,
+      `${workflow.resolved ? '[x]' : '[ ]'} Resolve ${requestLabel} for ${requesterName}`,
+      `${workflow.reportedBack ? '[x]' : '[ ]'} Send decision back to ${requesterName}`,
+      `${workflow.archived ? '[x]' : '[ ]'} Archive request notes for ${workflow.title}`,
+    ].slice(0, 8);
+  }
+
+  private workflowOpenLoops(employee: EmployeeRuntimeRecord) {
+    if (employee.requestWorkflow) {
+      const request = this.requests.get(employee.requestWorkflow.requestId);
+      return [
+        request
+          ? `${request.kind}: ${request.title} (${request.status})`
+          : `request: ${employee.requestWorkflow.title} (missing request record)`,
+      ];
+    }
+
+    if (employee.emailWorkflow) {
+      const helperLoops = employee.emailWorkflow.helpers
+        .filter((helper) => !helper.completed)
+        .map((helper) => {
+          const counterpartName = this.employees.get(helper.employeeId)?.name ?? helper.employeeId;
+          const request = helper.requestId ? this.requests.get(helper.requestId) : null;
+          return `second_opinion: ${employee.emailWorkflow?.subject} with ${counterpartName} (${request?.status ?? 'pending'})`;
+        });
+      const approvalLoop =
+        employee.emailWorkflow.gmApprovalRequired && !employee.emailWorkflow.approvalResolved
+          ? [`approval: ${employee.emailWorkflow.subject} (${employee.emailWorkflow.approvalRequestId ? 'pending' : 'not requested'})`]
+          : [];
+      const emailLoop = !employee.emailWorkflow.sent
+        ? [`email: ${employee.emailWorkflow.subject} (${employee.emailWorkflow.drafted ? 'drafted' : 'in progress'})`]
+        : [];
+
+      return [...helperLoops, ...approvalLoop, ...emailLoop].slice(0, 4);
+    }
+
+    return [
       ...this.requestSummariesForEmployee(employee.id, 'inbound').map(
         (request) => `${request.kind}: ${request.title} from ${request.counterpartName} (${request.status})`,
       ),
@@ -2375,13 +2979,29 @@ export class OfficeSimulationEngine {
       ),
       ...(employee.currentEmail ? [`Email: ${employee.currentEmail.subject} from ${employee.currentEmail.from}`] : []),
     ].slice(0, 4);
+  }
+
+  private syncLiveMemory(employee: EmployeeRuntimeRecord) {
+    this.syncWorkflowRuntimeContext(employee);
+    const checklist = this.workflowChecklist(employee);
+    const openLoops = this.workflowOpenLoops(employee);
     const recentContext = employee.activeMemory.slice(-2).map((item) => item.summary);
 
     this.vault.writeAgentLiveMemory({
       employeeName: employee.name,
       status: employee.phase,
-      focus: employee.currentPlan ? employee.taskTitle : 'Awaiting the next concrete task.',
-      objective: employee.currentPlan ? employee.objective : 'No active plan. Check priorities, pending requests, or ask leadership for the next useful initiative.',
+      focus:
+        employee.requestWorkflow || employee.emailWorkflow
+          ? employee.taskTitle
+          : employee.currentPlan
+            ? employee.taskTitle
+            : 'Awaiting the next concrete task.',
+      objective:
+        employee.requestWorkflow || employee.emailWorkflow
+          ? employee.objective
+          : employee.currentPlan
+            ? employee.objective
+            : 'No active plan. Check priorities, pending requests, or ask leadership for the next useful initiative.',
       checklist,
       openLoops,
       recentContext,
@@ -2510,8 +3130,248 @@ export class OfficeSimulationEngine {
     this.logAgentEvent(employee, 'Playbook Gap', `Proposed a playbook update for "${title}".\n\n${summary}`);
   }
 
+  private rememberTaskCompletion(employee: EmployeeRuntimeRecord, title: string, source: string) {
+    employee.workflowHabits.recentTaskHistory.push({
+      title,
+      source,
+      completedAt: nowIso(),
+    });
+    if (employee.workflowHabits.recentTaskHistory.length > 18) {
+      employee.workflowHabits.recentTaskHistory = employee.workflowHabits.recentTaskHistory.slice(-18);
+    }
+  }
+
+  private recordReflection(employee: EmployeeRuntimeRecord, title: string, summary: string, details: string, tags: string[]) {
+    employee.workflowHabits.reflections.push({
+      id: randomUUID(),
+      createdAt: nowIso(),
+      title,
+      summary,
+      tags: [...tags],
+    });
+    if (employee.workflowHabits.reflections.length > 16) {
+      employee.workflowHabits.reflections = employee.workflowHabits.reflections.slice(-16);
+    }
+
+    this.storeLongTermMemory(employee, {
+      title,
+      summary,
+      details,
+      kind: 'note',
+      tags,
+      importance: 2,
+    });
+  }
+
+  private updateCollaboratorHabit(employee: EmployeeRuntimeRecord, counterpartId: EmployeeId, requestKind: OfficeRequestKind, outcome: 'helpful' | 'stalled') {
+    const existing =
+      employee.workflowHabits.collaborators.find((entry) => entry.employeeId === counterpartId) ??
+      (() => {
+        const created: CollaboratorHabit = {
+          employeeId: counterpartId,
+          helpfulCount: 0,
+          stalledCount: 0,
+          lastWorkedAt: null,
+          requestKinds: [],
+        };
+        employee.workflowHabits.collaborators.push(created);
+        return created;
+      })();
+
+    if (outcome === 'helpful') {
+      existing.helpfulCount += 1;
+    } else {
+      existing.stalledCount += 1;
+    }
+    existing.lastWorkedAt = nowIso();
+    if (!existing.requestKinds.includes(requestKind)) {
+      existing.requestKinds.push(requestKind);
+    }
+  }
+
+  private learnedEmailPattern(employee: EmployeeRuntimeRecord, strategy: EmailHandlingStrategy) {
+    return employee.workflowHabits.emailPatterns.find((pattern) => pattern.key === emailPatternKey(strategy)) ?? null;
+  }
+
+  private applyLearnedEmailHabits(employee: EmployeeRuntimeRecord, strategy: EmailHandlingStrategy): EmailHandlingStrategy {
+    const pattern = this.learnedEmailPattern(employee, strategy);
+    if (!pattern) {
+      return strategy;
+    }
+
+    const learnedHelpers = pattern.preferredHelpers.map((employeeId) => emailHelperPlanFor(employeeId));
+    const shouldFavorSolo = pattern.soloCount >= 2 && pattern.collaborativeCount === 0 && strategy.complexity === 'simple';
+    return {
+      ...strategy,
+      helpers: shouldFavorSolo ? [] : dedupeEmailHelpers([...learnedHelpers, ...strategy.helpers]),
+      draftFocus:
+        strategy.draftFocus ??
+        (pattern.lastReflection.trim() ? `Follow the learned office workflow: ${pattern.lastReflection}`.slice(0, 220) : null),
+    };
+  }
+
+  private recentMatchingRequests(
+    fromId: EmployeeId,
+    toId: EmployeeId,
+    kind: OfficeRequestKind,
+    title: string,
+    details: string,
+    windowMs = 10 * 60_000,
+  ) {
+    const cutoff = Date.now() - windowMs;
+    return [...this.requests.values()]
+      .filter(
+        (request) =>
+          request.fromId === fromId &&
+          request.toId === toId &&
+          request.kind === kind &&
+          request.title === title &&
+          request.details === details &&
+          Date.parse(request.updatedAt) >= cutoff,
+      )
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  }
+
+  private chooseVariedPlan(employee: EmployeeRuntimeRecord, plans: TaskPlan[]) {
+    if (plans.length <= 1) {
+      return plans[0];
+    }
+
+    const recentTitles = new Set(employee.workflowHabits.recentTaskHistory.slice(-3).map((entry) => entry.title));
+    const varied = plans.filter((plan) => !recentTitles.has(plan.title));
+    return randomFrom(varied.length > 0 ? varied : plans);
+  }
+
+  private finalizeEmailWorkflow(employee: EmployeeRuntimeRecord, workflow: EmailWorkflowState) {
+    const patternKey = emailPatternKey({
+      complexity: workflow.complexity,
+      archiveResearch: workflow.archiveResearch,
+      gmApprovalRequired: workflow.gmApprovalRequired,
+      categoryTags: workflow.categoryTags,
+    });
+    const helperIds = workflow.helpers.filter((helper) => helper.completed).map((helper) => helper.employeeId);
+    const helperNames = helperIds.map((employeeId) => this.employees.get(employeeId)?.name ?? employeeId);
+    const summary =
+      helperNames.length > 0
+        ? `${employee.name} reflected that ${helperNames.join(', ')} helped move "${workflow.subject}" to completion.`
+        : `${employee.name} reflected that "${workflow.subject}" was completed cleanly as a solo desk workflow.`;
+    const details = [
+      `Workflow: Inbox: ${workflow.subject}`,
+      `Pattern key: ${patternKey}`,
+      `Complexity: ${workflow.complexity}`,
+      `Categories: ${workflow.categoryTags.join(', ')}`,
+      `Archive research: ${workflow.archiveResearch ? 'yes' : 'no'}`,
+      `Approval required: ${workflow.gmApprovalRequired ? 'yes' : 'no'}`,
+      `Helpers used: ${helperNames.join(', ') || 'none'}`,
+      helperIds.length > 0
+        ? `Learned workflow: For similar emails, consult ${helperNames.join(', ')} before the final draft if the same pattern appears again.`
+        : 'Learned workflow: Similar simple emails can usually be handled directly at the desk unless the facts become messy.',
+    ].join('\n');
+
+    const pattern =
+      employee.workflowHabits.emailPatterns.find((entry) => entry.key === patternKey) ??
+      (() => {
+        const created: EmailPatternHabit = {
+          key: patternKey,
+          label: emailPatternLabel({
+            complexity: workflow.complexity,
+            categoryTags: workflow.categoryTags,
+          }),
+          timesUsed: 0,
+          soloCount: 0,
+          collaborativeCount: 0,
+          helperUsage: [],
+          preferredHelpers: [],
+          archiveResearch: workflow.archiveResearch,
+          gmApprovalRequired: workflow.gmApprovalRequired,
+          categoryTags: [...workflow.categoryTags],
+          lastReflection: '',
+          lastUpdatedAt: nowIso(),
+        };
+        employee.workflowHabits.emailPatterns.push(created);
+        return created;
+      })();
+
+    pattern.timesUsed += 1;
+    pattern.lastReflection = helperIds.length > 0 ? `consult ${helperNames.join(', ')} before drafting` : 'solo desk handling worked';
+    pattern.lastUpdatedAt = nowIso();
+    if (helperIds.length > 0) {
+      pattern.collaborativeCount += 1;
+    } else {
+      pattern.soloCount += 1;
+    }
+
+    for (const helperId of helperIds) {
+      const usage =
+        pattern.helperUsage.find((entry) => entry.employeeId === helperId) ??
+        (() => {
+          const created = { employeeId: helperId, count: 0 };
+          pattern.helperUsage.push(created);
+          return created;
+        })();
+      usage.count += 1;
+      this.updateCollaboratorHabit(employee, helperId, 'second_opinion', 'helpful');
+    }
+
+    pattern.preferredHelpers = pattern.helperUsage
+      .slice()
+      .sort((left, right) => right.count - left.count)
+      .slice(0, 2)
+      .map((entry) => entry.employeeId);
+
+    this.rememberTaskCompletion(employee, `Inbox: ${workflow.subject}`, 'email-workflow');
+    this.recordReflection(employee, `Reflection: Inbox: ${workflow.subject}`, summary, details, ['reflection', 'workflow', 'email', patternKey]);
+  }
+
+  private finalizeRequestWorkflow(employee: EmployeeRuntimeRecord, workflow: RequestWorkflowState, request: OfficeRequest | null) {
+    const requesterName = request ? this.employees.get(request.fromId)?.name ?? request.fromId : 'the requester';
+    const summary = `${employee.name} reflected on resolving ${workflow.kind} for ${requesterName}.`;
+    const details = [
+      `Workflow: Handle ${workflow.kind}`,
+      `Title: ${workflow.title}`,
+      `Requester: ${requesterName}`,
+      `Needs archives: ${workflow.needsArchives ? 'yes' : 'no'}`,
+      `Resolved: ${workflow.resolved ? 'yes' : 'no'}`,
+      'Learned workflow: keep request handling one step at a time, answer the request directly, and archive the decision afterward.',
+    ].join('\n');
+
+    this.rememberTaskCompletion(employee, `Handle ${workflow.kind}`, 'request-workflow');
+    this.recordReflection(employee, `Reflection: Handle ${workflow.kind}`, summary, details, ['reflection', 'workflow', 'request', workflow.kind]);
+  }
+
   private pendingInboxEmails() {
     return this.vault.loadInboxEmails().filter((email) => !this.processedEmailIds.has(email.id));
+  }
+
+  private reservedInboxEmailIds(excludingEmployeeId?: EmployeeId) {
+    const reserved = new Set<string>();
+
+    for (const employee of this.employees.values()) {
+      if (employee.id === excludingEmployeeId) {
+        continue;
+      }
+
+      if (employee.currentEmail?.id) {
+        reserved.add(employee.currentEmail.id);
+      }
+
+      if (employee.emailWorkflow?.emailId) {
+        reserved.add(employee.emailWorkflow.emailId);
+      }
+
+      for (const action of employee.currentPlan?.actions ?? []) {
+        if ((action.type === 'review_email' || action.type === 'draft_email' || action.type === 'send_email') && action.notes) {
+          reserved.add(action.notes);
+        }
+      }
+    }
+
+    return reserved;
+  }
+
+  private nextAssignableInboxEmail(excludingEmployeeId?: EmployeeId) {
+    const reserved = this.reservedInboxEmailIds(excludingEmployeeId);
+    return this.pendingInboxEmails().find((email) => !reserved.has(email.id)) ?? null;
   }
 
   private hasOfficeBootstrapRecord() {
@@ -2522,13 +3382,444 @@ export class OfficeSimulationEngine {
     );
   }
 
+  private officeRecordById(recordId: string) {
+    return [...this.officeBacklog, ...this.officeClients, ...this.officeProjects, ...this.officeFinance, ...this.officeNotes].find(
+      (record) => record.id === recordId,
+    );
+  }
+
+  private officeRecordActivityFor(record: VaultOfficeSystemRecord) {
+    return (
+      this.officeRecordActivity.get(record.id) ?? {
+        recordId: record.id,
+        title: record.title,
+        completedCount: 0,
+        lastAssignedAt: null,
+        lastCompletedAt: null,
+        lastOwnerId: null,
+        cooldownUntil: null,
+      }
+    );
+  }
+
+  private officeRecordCooldownMs(record: VaultOfficeSystemRecord) {
+    if (record.priority === 'high') {
+      return 6 * 60_000;
+    }
+    if (record.priority === 'medium') {
+      return 10 * 60_000;
+    }
+    return 14 * 60_000;
+  }
+
+  private markOfficeRecordAssigned(recordId: string | null | undefined, employeeId: EmployeeId) {
+    if (!recordId) {
+      return;
+    }
+
+    const record = this.officeRecordById(recordId);
+    if (!record) {
+      return;
+    }
+
+    const activity = this.officeRecordActivityFor(record);
+    activity.title = record.title;
+    activity.lastAssignedAt = nowIso();
+    activity.lastOwnerId = employeeId;
+    this.officeRecordActivity.set(record.id, activity);
+  }
+
+  private markOfficeRecordCompleted(recordId: string | null | undefined, employeeId: EmployeeId) {
+    if (!recordId) {
+      return;
+    }
+
+    const record = this.officeRecordById(recordId);
+    if (!record) {
+      return;
+    }
+
+    const activity = this.officeRecordActivityFor(record);
+    activity.title = record.title;
+    activity.completedCount += 1;
+    activity.lastOwnerId = employeeId;
+    activity.lastCompletedAt = nowIso();
+    activity.cooldownUntil = new Date(Date.now() + this.officeRecordCooldownMs(record)).toISOString();
+    this.officeRecordActivity.set(record.id, activity);
+  }
+
+  private buildOfficeSystemsFallbackPlans(employee: EmployeeRuntimeRecord) {
+    const recentTitles = new Set(employee.workflowHabits.recentTaskHistory.slice(-6).map((entry) => entry.title));
+    const activeRecordIds = new Set(
+      [...this.employees.values()]
+        .map((otherEmployee) => otherEmployee.currentPlan?.officeRecordId ?? null)
+        .filter((recordId): recordId is string => Boolean(recordId)),
+    );
+    const now = Date.now();
+    const allRecords = [
+      ...this.officeBacklog,
+      ...this.officeProjects,
+      ...this.officeClients,
+      ...this.officeFinance,
+      ...this.officeNotes,
+    ];
+
+    const rankedRecords = allRecords
+      .filter((record) => !activeRecordIds.has(record.id))
+      .map((record) => {
+        const activity = this.officeRecordActivityFor(record);
+        const cooldownUntil = activity.cooldownUntil ? Date.parse(activity.cooldownUntil) : 0;
+        const coolingDown = Number.isFinite(cooldownUntil) && cooldownUntil > now;
+        const lastCompletedAt = activity.lastCompletedAt ? Date.parse(activity.lastCompletedAt) : 0;
+        const staleMinutes = lastCompletedAt > 0 ? Math.min(30, Math.floor((now - lastCompletedAt) / 60_000)) : 30;
+        const priorityWeight = record.priority === 'high' ? 35 : record.priority === 'medium' ? 24 : 16;
+        const ownerBias =
+          record.owner.toLowerCase().includes(employee.name.toLowerCase()) || record.owner.toLowerCase().includes(employee.position.toLowerCase())
+            ? 10
+            : record.owner.toLowerCase().includes('shared') || record.owner.toLowerCase().includes('customer relations') || record.owner.toLowerCase().includes('coordinator')
+              ? 4
+              : 0;
+        const noveltyBonus = recentTitles.has(record.title) ? -18 : 6;
+        const repetitionPenalty = activity.completedCount * 2;
+        const sameOwnerPenalty = activity.lastOwnerId === employee.id ? 7 : 0;
+        const score =
+          priorityWeight +
+          staleMinutes +
+          ownerBias +
+          noveltyBonus +
+          (record.status === 'review' ? 6 : 0) -
+          repetitionPenalty -
+          sameOwnerPenalty -
+          (coolingDown ? 1000 : 0);
+
+        return { record, score, coolingDown, cooldownUntil };
+      })
+      .sort((left, right) => right.score - left.score || left.record.updatedAt.localeCompare(right.record.updatedAt));
+
+    const preferred = rankedRecords.filter((entry) => !entry.coolingDown).slice(0, 6);
+    const fallback = preferred.length > 0 ? preferred : rankedRecords.slice(0, 3);
+    return fallback.map(({ record }) => buildPlanFromOfficeRecord(employee, record));
+  }
+
   private buildReducedRosterFallbackPlan(employee: EmployeeRuntimeRecord) {
+    const officeSystemPlans = this.buildOfficeSystemsFallbackPlans(employee);
+    if (officeSystemPlans.length > 0) {
+      return this.chooseVariedPlan(employee, officeSystemPlans);
+    }
+
     if (!this.hasOfficeBootstrapRecord()) {
       return buildReducedRosterLeadershipPlan(employee);
     }
 
     const weightedPlans = [buildReducedRosterDiscoveryPlan(employee), ...defaultPlansFor(employee)];
-    return randomFrom(weightedPlans);
+    return this.chooseVariedPlan(employee, weightedPlans);
+  }
+
+  private startEmailWorkflow(employee: EmployeeRuntimeRecord, email: VaultEmail) {
+    employee.emailWorkflow = createEmailWorkflowState(email, this.applyLearnedEmailHabits(employee, classifyInboxEmail(email)));
+    this.normalizeEmailWorkflowHelpers(employee, employee.emailWorkflow);
+    employee.currentEmail = null;
+    employee.draftedEmailBody = null;
+    employee.taskTitle = emailWorkflowTitle(employee.emailWorkflow);
+    employee.objective = emailWorkflowObjective(employee, employee.emailWorkflow);
+    this.addMemory(employee.id, 'task', `${employee.name} opened "${employee.taskTitle}".`, {
+      relatedLocationId: employee.assignedLocationId,
+      importance: 2,
+    });
+    this.pushSystemLog(`${employee.name} opened workflow "${employee.taskTitle}".`);
+    this.logAgentEvent(
+      employee,
+      'Workflow Opened',
+      `Objective: ${employee.objective}\n\nChecklist:\n${this.emailWorkflowChecklist(employee, employee.emailWorkflow).map((item) => `- ${item}`).join('\n')}`,
+    );
+  }
+
+  private startRequestWorkflow(employee: EmployeeRuntimeRecord, request: OfficeRequest) {
+    employee.requestWorkflow = createRequestWorkflowState(request);
+    employee.taskTitle = requestWorkflowTitle(request);
+    employee.objective = requestWorkflowObjective(employee, request);
+    this.addMemory(employee.id, 'task', `${employee.name} opened "${employee.taskTitle}".`, {
+      referenceId: request.id,
+      relatedLocationId: employee.assignedLocationId,
+      relatedEmployeeId: request.fromId,
+      importance: 2,
+    });
+    this.pushSystemLog(`${employee.name} opened workflow "${employee.taskTitle}".`);
+    this.logAgentEvent(
+      employee,
+      'Workflow Opened',
+      `Objective: ${employee.objective}\n\nChecklist:\n${this.requestWorkflowChecklist(employee, employee.requestWorkflow).map((item) => `- ${item}`).join('\n')}`,
+    );
+  }
+
+  private buildSingleActionWorkflowPlan(
+    title: string,
+    objective: string,
+    source: PlanSource,
+    action: OfficeAction,
+    requestId?: string | null,
+  ) {
+    if (requestId) {
+      action.requestId = requestId;
+    }
+    return buildPlan(title, objective, [action], source);
+  }
+
+  private nextEmailWorkflowPlan(employee: EmployeeRuntimeRecord) {
+    this.syncWorkflowRuntimeContext(employee);
+    const workflow = employee.emailWorkflow;
+    if (!workflow) {
+      return null;
+    }
+
+    const title = emailWorkflowTitle(workflow);
+    const objective = emailWorkflowObjective(employee, workflow);
+
+    if (!workflow.deskNotesRead) {
+      return this.buildSingleActionWorkflowPlan(
+        title,
+        objective,
+        'workflow',
+        buildAction('read_private_notes', employee.assignedLocationId, 'Review desk notes and prior drafts', {
+          notes: workflow.emailId,
+        }),
+      );
+    }
+
+    if (!workflow.emailReviewed) {
+      return this.buildSingleActionWorkflowPlan(
+        title,
+        objective,
+        'workflow',
+        buildAction('review_email', employee.assignedLocationId, `Review inbox email: ${workflow.subject}`, {
+          notes: workflow.emailId,
+        }),
+      );
+    }
+
+    if (workflow.archiveResearch && !workflow.archivesReviewed) {
+      return this.buildSingleActionWorkflowPlan(
+        title,
+        objective,
+        'workflow',
+        buildAction('read_archives', 'archives', `Check archives and playbook for ${workflow.subject}`, {
+          notes: workflow.emailId,
+        }),
+      );
+    }
+
+    const nextHelper = workflow.helpers.find((helper) => !helper.completed);
+    if (nextHelper) {
+      if (!nextHelper.requestId) {
+        return this.buildSingleActionWorkflowPlan(
+          title,
+          objective,
+          'workflow',
+          buildAction(nextHelper.actionType, nextHelper.locationId, `Consult ${locationLabel(nextHelper.locationId)} on ${workflow.subject}`, {
+            counterpartId: nextHelper.employeeId,
+            requestKind: nextHelper.requestKind,
+            notes: workflow.emailId,
+          }),
+        );
+      }
+
+      const request = this.requests.get(nextHelper.requestId);
+      if (!request || request.status !== 'pending') {
+        nextHelper.completed = true;
+      } else {
+        return null;
+      }
+    }
+
+    if (!workflow.drafted) {
+      return this.buildSingleActionWorkflowPlan(
+        title,
+        objective,
+        'workflow',
+        buildAction('draft_email', employee.assignedLocationId, `Draft reply to ${employee.currentEmail?.from ?? 'sender'}`, {
+          notes: workflow.emailId,
+        }),
+      );
+    }
+
+    if (workflow.gmApprovalRequired && !workflow.approvalResolved) {
+      if (!workflow.approvalRequestId) {
+        return this.buildSingleActionWorkflowPlan(
+          title,
+          objective,
+          'workflow',
+          buildAction('ask_permission', 'general-manager', `Request approval for ${workflow.subject}`, {
+            counterpartId: gmEmployeeIdFor(employee.id),
+            requestKind: 'approval',
+            notes: workflow.emailId,
+          }),
+        );
+      }
+
+      const request = this.requests.get(workflow.approvalRequestId);
+      if (!request || request.status === 'approved' || request.status === 'fulfilled') {
+        workflow.approvalResolved = true;
+      } else if (request.status === 'pending') {
+        return null;
+      }
+    }
+
+    if (!workflow.sent) {
+      return this.buildSingleActionWorkflowPlan(
+        title,
+        objective,
+        'workflow',
+        buildAction('send_email', employee.assignedLocationId, `Send reply to ${employee.currentEmail?.from ?? 'sender'}`, {
+          notes: workflow.emailId,
+          requiresApproval: workflow.gmApprovalRequired,
+        }),
+      );
+    }
+
+    if (!workflow.archived) {
+      return this.buildSingleActionWorkflowPlan(
+        title,
+        objective,
+        'workflow',
+        buildAction('archive_note', 'archives', `Archive email resolution for ${workflow.subject}`, {
+          notes: workflow.emailId,
+        }),
+      );
+    }
+
+    employee.emailWorkflow = null;
+    return null;
+  }
+
+  private nextRequestWorkflowPlan(employee: EmployeeRuntimeRecord) {
+    this.syncWorkflowRuntimeContext(employee);
+    const workflow = employee.requestWorkflow;
+    if (!workflow) {
+      return null;
+    }
+
+    const request = this.requests.get(workflow.requestId);
+    if (!request) {
+      employee.requestWorkflow = null;
+      return null;
+    }
+
+    const requesterName = this.employees.get(request.fromId)?.name ?? request.fromId;
+    const title = requestWorkflowTitle(request);
+    const objective = requestWorkflowObjective(employee, request);
+    const recentSummaries = [...employee.activeMemory, ...employee.passiveMemory].map((memory) => memory.summary.toLowerCase());
+
+    if (!workflow.deskNotesRead && recentSummaries.some((summary) => summary.includes('completed "refresh personal memory"'))) {
+      workflow.deskNotesRead = true;
+    }
+    if (
+      !workflow.contextReviewed &&
+      recentSummaries.some((summary) => summary.includes(`completed "review ${request.kind.replace('_', ' ')} context"`))
+    ) {
+      workflow.contextReviewed = true;
+    }
+    if (
+      !workflow.archivesReviewed &&
+      recentSummaries.some((summary) => summary.includes(`completed "check archives and playbook for ${request.title.toLowerCase()}"`))
+    ) {
+      workflow.archivesReviewed = true;
+    }
+    if (!workflow.investigationDone && recentSummaries.some((summary) => summary.includes(`completed "inspect ${request.title.toLowerCase()}"`))) {
+      workflow.investigationDone = true;
+    }
+    if (!workflow.reportedBack && recentSummaries.some((summary) => summary.includes(`completed "send decision back to ${requesterName.toLowerCase()}"`))) {
+      workflow.reportedBack = true;
+    }
+
+    if (!workflow.deskNotesRead) {
+      return this.buildSingleActionWorkflowPlan(
+        title,
+        objective,
+        'workflow',
+        buildAction('read_private_notes', employee.assignedLocationId, 'Refresh personal memory', {
+          notes: workflow.requestId,
+        }),
+        workflow.requestId,
+      );
+    }
+
+    if (!workflow.contextReviewed) {
+      return this.buildSingleActionWorkflowPlan(
+        title,
+        objective,
+        'workflow',
+        buildAction('fetch_context', employee.assignedLocationId, `Review ${request.kind.replace('_', ' ')} context`, {
+          notes: workflow.requestId,
+        }),
+        workflow.requestId,
+      );
+    }
+
+    if (workflow.needsArchives && !workflow.archivesReviewed) {
+      return this.buildSingleActionWorkflowPlan(
+        title,
+        objective,
+        'workflow',
+        buildAction('read_archives', 'archives', `Check archives and playbook for ${request.title.toLowerCase()}`, {
+          notes: workflow.requestId,
+        }),
+        workflow.requestId,
+      );
+    }
+
+    if (!workflow.investigationDone) {
+      return this.buildSingleActionWorkflowPlan(
+        title,
+        objective,
+        'workflow',
+        buildAction('investigate', request.locationId, `Inspect ${request.title.toLowerCase()}`, {
+          counterpartId: request.fromId,
+          notes: workflow.requestId,
+        }),
+        workflow.requestId,
+      );
+    }
+
+    if (!workflow.resolved) {
+      return this.buildSingleActionWorkflowPlan(
+        title,
+        objective,
+        'workflow',
+        buildAction('resolve_request', employee.assignedLocationId, `Resolve ${request.kind} for ${requesterName}`, {
+          counterpartId: request.fromId,
+          notes: workflow.requestId,
+        }),
+        workflow.requestId,
+      );
+    }
+
+    if (!workflow.reportedBack) {
+      return this.buildSingleActionWorkflowPlan(
+        title,
+        objective,
+        'workflow',
+        buildAction('report_back', request.locationId, `Send decision back to ${requesterName}`, {
+          counterpartId: request.fromId,
+          notes: workflow.requestId,
+        }),
+        workflow.requestId,
+      );
+    }
+
+    if (!workflow.archived) {
+      return this.buildSingleActionWorkflowPlan(
+        title,
+        objective,
+        'workflow',
+        buildAction('archive_note', 'archives', `Archive request notes for ${request.title}`, {
+          notes: workflow.requestId,
+        }),
+        workflow.requestId,
+      );
+    }
+
+    employee.requestWorkflow = null;
+    return null;
   }
 
   private resolveInboxEmail(emailId: string | null) {
@@ -2536,7 +3827,7 @@ export class OfficeSimulationEngine {
     if (emailId) {
       return inboxEmails.find((email) => email.id === emailId) ?? null;
     }
-    return inboxEmails[0] ?? null;
+    return this.nextAssignableInboxEmail() ?? inboxEmails[0] ?? null;
   }
 
   private readPrivateDeskNotes(employee: EmployeeRuntimeRecord) {
@@ -2602,27 +3893,38 @@ export class OfficeSimulationEngine {
 
   private composeEmailDraft(employee: EmployeeRuntimeRecord, email: VaultEmail) {
     const senderName = email.from.split('@')[0]?.replace(/[._-]+/g, ' ') || email.from;
-    const helperNames = Array.from(
-      new Set(
-        (employee.currentPlan?.actions ?? [])
-          .filter((action) => action.type === 'second_opinion' || action.type === 'request_review')
-          .map((action) => action.counterpartId)
-          .filter((counterpartId): counterpartId is EmployeeId => Boolean(counterpartId))
-          .map((counterpartId) => this.employees.get(counterpartId)?.name ?? counterpartId),
-      ),
-    );
-    const approvalAction = (employee.currentPlan?.actions ?? []).find((action) => action.type === 'ask_permission');
-    const approvalStatus = approvalAction?.requestId ? this.requests.get(approvalAction.requestId)?.status ?? null : null;
-    const approvalResolved = approvalStatus === 'approved' || approvalStatus === 'fulfilled';
+    const workflow = employee.emailWorkflow?.emailId === email.id ? employee.emailWorkflow : null;
+    const helperNames = workflow
+      ? Array.from(
+          new Set(
+            workflow.helpers
+              .filter((helper) => helper.completed)
+              .map((helper) => this.employees.get(helper.employeeId)?.name ?? helper.employeeId),
+          ),
+        )
+      : Array.from(
+          new Set(
+            (employee.currentPlan?.actions ?? [])
+              .filter((action) => action.type === 'second_opinion' || action.type === 'request_review')
+              .map((action) => action.counterpartId)
+              .filter((counterpartId): counterpartId is EmployeeId => Boolean(counterpartId))
+              .map((counterpartId) => this.employees.get(counterpartId)?.name ?? counterpartId),
+          ),
+        );
+    const approvalRequired = workflow ? workflow.gmApprovalRequired : Boolean((employee.currentPlan?.actions ?? []).find((action) => action.type === 'ask_permission'));
+    const approvalStatus = workflow?.approvalRequestId ? this.requests.get(workflow.approvalRequestId)?.status ?? null : null;
+    const approvalResolved = workflow ? workflow.approvalResolved : approvalStatus === 'approved' || approvalStatus === 'fulfilled';
 
     const internalNote =
       helperNames.length > 0
         ? `I reviewed this with ${helperNames.join(', ')} before finalizing the response.`
         : 'I reviewed the request directly and handled the full office pass on my desk.';
-    const approvalNote = approvalResolved
-      ? 'The response below reflects the current office decision under General Manager sign-off.'
-      : 'The final outgoing response is still waiting on General Manager sign-off before anything is confirmed.';
-    const closingNote = approvalResolved
+    const approvalNote = !approvalRequired
+      ? 'The response below reflects the current office decision.'
+      : approvalResolved
+        ? 'The response below reflects the current office decision under General Manager sign-off.'
+        : 'The final outgoing response is still waiting on General Manager sign-off before anything is confirmed.';
+    const closingNote = !approvalRequired || approvalResolved
       ? 'If anything changes on our side, I will follow up, but this is the current finalized update.'
       : 'I will keep you updated if anything changes, but the request is now in motion.';
 
@@ -2672,7 +3974,9 @@ export class OfficeSimulationEngine {
     const body = this.composeEmailDraft(employee, email);
     this.vault.appendSentEmail({
       subject: `Re: ${email.subject}`,
+      toName: email.fromName,
       to: email.from,
+      fromName: employee.name,
       from: 'office@no-mans-ai.local',
       body,
       sentBy: employee.name,
@@ -2687,6 +3991,111 @@ export class OfficeSimulationEngine {
     this.syncLiveMemory(employee);
   }
 
+  private markWorkflowActionCompleted(employee: EmployeeRuntimeRecord, action: OfficeAction) {
+    const emailWorkflow = employee.emailWorkflow;
+    if (emailWorkflow && action.notes === emailWorkflow.emailId) {
+      switch (action.type) {
+        case 'read_private_notes':
+          emailWorkflow.deskNotesRead = true;
+          break;
+        case 'review_email':
+          emailWorkflow.emailReviewed = true;
+          break;
+        case 'read_archives':
+          emailWorkflow.archivesReviewed = true;
+          break;
+        case 'draft_email':
+          emailWorkflow.drafted = true;
+          break;
+        case 'send_email':
+          emailWorkflow.sent = true;
+          break;
+        case 'archive_note':
+          emailWorkflow.archived = true;
+          this.finalizeEmailWorkflow(employee, cloneEmailWorkflowState(emailWorkflow));
+          employee.emailWorkflow = null;
+          break;
+        default:
+          break;
+      }
+    }
+
+    const requestWorkflow = employee.requestWorkflow;
+    if (requestWorkflow && action.notes === requestWorkflow.requestId) {
+      switch (action.type) {
+        case 'read_private_notes':
+          requestWorkflow.deskNotesRead = true;
+          break;
+        case 'fetch_context':
+          requestWorkflow.contextReviewed = true;
+          break;
+        case 'read_archives':
+          requestWorkflow.archivesReviewed = true;
+          break;
+        case 'investigate':
+          requestWorkflow.investigationDone = true;
+          break;
+        case 'resolve_request':
+          requestWorkflow.resolved = true;
+          break;
+        case 'report_back':
+          requestWorkflow.reportedBack = true;
+          break;
+        case 'archive_note':
+          requestWorkflow.archived = true;
+          this.finalizeRequestWorkflow(employee, cloneRequestWorkflowState(requestWorkflow), this.requests.get(requestWorkflow.requestId) ?? null);
+          employee.requestWorkflow = null;
+          break;
+        default:
+          break;
+      }
+    }
+  }
+
+  private markWorkflowRequestCreated(employee: EmployeeRuntimeRecord, action: OfficeAction, requestId: string) {
+    const emailWorkflow = employee.emailWorkflow;
+    if (!emailWorkflow || action.notes !== emailWorkflow.emailId) {
+      return;
+    }
+
+    if (action.type === 'ask_permission') {
+      emailWorkflow.approvalRequestId = requestId;
+      return;
+    }
+
+    const helper = emailWorkflow.helpers.find(
+      (candidate) =>
+        candidate.employeeId === action.counterpartId &&
+        candidate.actionType === action.type &&
+        !candidate.completed &&
+        !candidate.requestId,
+    );
+    if (helper) {
+      helper.requestId = requestId;
+    }
+  }
+
+  private markWorkflowRequestResolved(employee: EmployeeRuntimeRecord, request: OfficeRequest, approved: boolean) {
+    const emailWorkflow = employee.emailWorkflow;
+    if (!emailWorkflow) {
+      return;
+    }
+
+    if (emailWorkflow.approvalRequestId === request.id) {
+      if (approved) {
+        emailWorkflow.approvalResolved = true;
+      } else {
+        emailWorkflow.approvalRequestId = null;
+      }
+      return;
+    }
+
+    const helper = emailWorkflow.helpers.find((candidate) => candidate.requestId === request.id);
+    if (helper) {
+      helper.completed = true;
+    }
+  }
+
   private enqueueLivePlan(employeeId: EmployeeId) {
     const employee = this.employees.get(employeeId);
     if (!employee || !this.planner || employee.phase !== 'idle' || employee.currentPlan || employee.planning || this.status.state !== 'running') {
@@ -2699,6 +4108,11 @@ export class OfficeSimulationEngine {
     }
 
     if (employee.plannerRetryAt > Date.now()) {
+      return;
+    }
+
+    if (isLoopbackBaseUrl(this.planner.baseUrl) || this.planner.model.includes(':')) {
+      void this.requestLivePlan(employeeId);
       return;
     }
 
@@ -2943,12 +4357,38 @@ export class OfficeSimulationEngine {
       return;
     }
 
+    if (employee.requestWorkflow) {
+      const requestPlan = this.nextRequestWorkflowPlan(employee);
+      if (requestPlan) {
+        this.applyPlan(employee, requestPlan, false);
+        return;
+      }
+    }
+
+    if (employee.emailWorkflow) {
+      const emailPlan = this.nextEmailWorkflowPlan(employee);
+      if (emailPlan) {
+        this.applyPlan(employee, emailPlan, false);
+        return;
+      }
+    }
+
     const inbound = this.nextPendingRequestFor(employee.id);
     if (inbound) {
-      if (this.planner) {
-        this.enqueueLivePlan(employee.id);
-      } else {
-        this.applyPlan(employee, buildRequestHandlingPlan(employee, inbound), false);
+      this.startRequestWorkflow(employee, inbound);
+      const requestPlan = this.nextRequestWorkflowPlan(employee);
+      if (requestPlan) {
+        this.applyPlan(employee, requestPlan, false);
+      }
+      return;
+    }
+
+    const assignableInboxEmail = canHandleInbox(employee) ? this.nextAssignableInboxEmail(employee.id) : null;
+    if (assignableInboxEmail) {
+      this.startEmailWorkflow(employee, assignableInboxEmail);
+      const emailPlan = this.nextEmailWorkflowPlan(employee);
+      if (emailPlan) {
+        this.applyPlan(employee, emailPlan, false);
       }
       return;
     }
@@ -2960,7 +4400,7 @@ export class OfficeSimulationEngine {
     }
 
     if (roleBacklogBoost(employee, this.countOverflowRequests())) {
-      if (this.planner) {
+      if (this.planner && !REDUCED_ROSTER_TEST_MODE) {
         this.enqueueLivePlan(employee.id);
       } else {
         this.applyPlan(employee, buildSupportPlan(employee), false);
@@ -2968,13 +4408,13 @@ export class OfficeSimulationEngine {
       return;
     }
 
-    if (this.planner) {
+    if (this.planner && !REDUCED_ROSTER_TEST_MODE) {
       this.enqueueLivePlan(employee.id);
       return;
     }
 
-    const plans = defaultPlansFor(employee);
-    this.applyPlan(employee, randomFrom(plans), false);
+    const fallbackPlan = REDUCED_ROSTER_TEST_MODE ? this.buildReducedRosterFallbackPlan(employee) : randomFrom(defaultPlansFor(employee));
+    this.applyPlan(employee, fallbackPlan, false);
   }
 
   private maybeInterruptForPriorityWork(employee: EmployeeRuntimeRecord) {
@@ -2985,31 +4425,37 @@ export class OfficeSimulationEngine {
     }
 
     const inbound = this.nextPendingRequestFor(employee.id);
-    if (inbound) {
+    if (inbound && !employee.requestWorkflow) {
       if (currentPlan) {
         this.abandonCurrentPlan(employee, `Priority request from ${this.employees.get(inbound.fromId)?.name ?? inbound.fromId}`);
       }
-      if (this.planner) {
-        this.enqueueLivePlan(employee.id);
-      } else {
-        this.applyPlan(employee, buildRequestHandlingPlan(employee, inbound), false);
+      this.startRequestWorkflow(employee, inbound);
+      const requestPlan = this.nextRequestWorkflowPlan(employee);
+      if (requestPlan) {
+        this.applyPlan(employee, requestPlan, false);
       }
       return true;
     }
 
     if (canHandleInbox(employee)) {
-      const email = this.pendingInboxEmails()[0];
-      const alreadyHandlingEmail = Boolean(employee.currentEmail) || currentPlan?.actions.some((action) =>
-        action.type === 'review_email' || action.type === 'draft_email' || action.type === 'send_email',
-      );
+      const email = this.nextAssignableInboxEmail(employee.id);
+      const alreadyHandlingEmail =
+        Boolean(employee.currentEmail) ||
+        Boolean(employee.emailWorkflow) ||
+        currentPlan?.actions.some((action) => action.type === 'review_email' || action.type === 'draft_email' || action.type === 'send_email');
       if (email && !alreadyHandlingEmail) {
+        const planStartedAt = currentPlan ? Date.parse(currentPlan.createdAt) : 0;
+        const withinInterruptGraceWindow = Boolean(currentPlan && Number.isFinite(planStartedAt) && Date.now() - planStartedAt < PLAN_INTERRUPT_GRACE_MS);
+        if (withinInterruptGraceWindow) {
+          return false;
+        }
         if (currentPlan) {
           this.abandonCurrentPlan(employee, `Priority inbox item "${email.subject}"`);
         }
-        if (this.planner) {
-          this.enqueueLivePlan(employee.id);
-        } else {
-          this.applyPlan(employee, buildEmailHandlingPlan(employee, email), false);
+        this.startEmailWorkflow(employee, email);
+        const emailPlan = this.nextEmailWorkflowPlan(employee);
+        if (emailPlan) {
+          this.applyPlan(employee, emailPlan, false);
         }
         return true;
       }
@@ -3020,6 +4466,7 @@ export class OfficeSimulationEngine {
 
   private abandonCurrentPlan(employee: EmployeeRuntimeRecord, reason: string) {
     const abandonedTitle = employee.taskTitle;
+    const abandonedRequestId = this.requestIdForPlan(employee.currentPlan);
     employee.currentPlan = null;
     employee.currentActionIndex = 0;
     employee.targetLocationId = null;
@@ -3028,6 +4475,7 @@ export class OfficeSimulationEngine {
     employee.status = `Holding at ${locationLabel(employee.currentLocationId)}`;
     employee.lastUpdatedAt = nowIso();
     employee.planVersion += 1;
+    this.clearRequestReplying(abandonedRequestId);
     this.logAgentEvent(employee, 'Plan Interrupted', `${reason}\n\nInterrupted plan: ${abandonedTitle}`);
     this.pushSystemLog(`${employee.name} interrupted "${abandonedTitle}" to handle priority work.`);
   }
@@ -3124,6 +4572,8 @@ export class OfficeSimulationEngine {
       this.archiveKnowledge(employee, action);
     }
 
+    this.markWorkflowActionCompleted(employee, action);
+
     this.addMemory(employee.id, memoryKind, `${employee.name} completed "${action.label}".`, {
       referenceId: employee.currentPlan?.id ?? null,
       relatedLocationId: action.locationId,
@@ -3151,11 +4601,42 @@ export class OfficeSimulationEngine {
     }
 
     const requestKind = action.requestKind ?? requestKindForAction(action.type) ?? 'review';
+    const requestDetails = action.notes ?? `${employee.position} needs ${requestKind.replace('_', ' ')} on ${action.label.toLowerCase()}.`;
+    const recentMatches = this.recentMatchingRequests(employee.id, counterpartId, requestKind, action.label, requestDetails);
+    const recentReusable = requestKind === 'approval' ? null : recentMatches[0] ?? null;
+    if (recentReusable) {
+      action.requestId = recentReusable.id;
+      this.markWorkflowRequestCreated(employee, action, recentReusable.id);
+
+      if (recentReusable.status === 'pending') {
+        action.status = 'waiting';
+        employee.phase = 'waiting';
+        employee.planVersion += 1;
+        employee.lastUpdatedAt = nowIso();
+        this.refreshStatus(employee);
+        this.pushSystemLog(`${employee.name} reused an open ${requestKind} thread with ${this.employees.get(counterpartId)?.name ?? counterpartId}.`);
+        this.syncLiveMemory(employee);
+        return;
+      }
+
+      this.markWorkflowRequestResolved(employee, recentReusable, recentReusable.status !== 'rejected' && recentReusable.status !== 'escalated');
+      action.status = 'done';
+      this.addMemory(employee.id, 'context', `${employee.name} reused recent ${requestKind} context from ${this.employees.get(counterpartId)?.name ?? counterpartId}.`, {
+        referenceId: recentReusable.id,
+        relatedEmployeeId: counterpartId,
+        relatedLocationId: action.locationId,
+        importance: 2,
+      });
+      this.pushSystemLog(`${employee.name} reused recent ${requestKind} context for "${action.label}" instead of opening a duplicate thread.`);
+      this.advanceToNextAction(employee);
+      return;
+    }
+
     const request: OfficeRequest = {
       id: randomUUID(),
       kind: requestKind,
       title: action.label,
-      details: action.notes ?? `${employee.position} needs ${requestKind.replace('_', ' ')} on ${action.label.toLowerCase()}.`,
+      details: requestDetails,
       fromId: employee.id,
       toId: counterpartId,
       locationId: action.locationId,
@@ -3163,10 +4644,14 @@ export class OfficeSimulationEngine {
       createdAt: nowIso(),
       updatedAt: nowIso(),
       decisionSummary: null,
+      readAt: null,
+      replyingAt: null,
+      replyReadAt: null,
     };
 
     this.requests.set(request.id, request);
     action.requestId = request.id;
+    this.markWorkflowRequestCreated(employee, action, request.id);
     action.status = 'waiting';
     employee.phase = 'waiting';
     employee.planVersion += 1;
@@ -3234,6 +4719,8 @@ export class OfficeSimulationEngine {
     request.status = decision.approved ? 'approved' : 'rejected';
     request.updatedAt = nowIso();
     request.decisionSummary = decision.summary;
+    request.replyingAt = null;
+    request.replyReadAt = null;
 
     if (request.kind === 'approval') {
       employee.performance.approvalsGiven += 1;
@@ -3241,6 +4728,7 @@ export class OfficeSimulationEngine {
     employee.lastUpdatedAt = nowIso();
     employee.planVersion += 1;
     action.status = 'done';
+    this.markWorkflowActionCompleted(employee, action);
 
     const requester = this.employees.get(request.fromId);
     if (requester) {
@@ -3264,7 +4752,10 @@ export class OfficeSimulationEngine {
         relatedLocationId: request.locationId,
         importance: decision.approved ? 2 : 3,
       });
+      this.updateCollaboratorHabit(requester, employee.id, request.kind, decision.approved ? 'helpful' : 'stalled');
     }
+
+    this.updateCollaboratorHabit(employee, request.fromId, request.kind, decision.approved ? 'helpful' : 'stalled');
 
     this.addMemory(employee.id, 'review', `${employee.name} ${decision.approved ? 'approved' : 'rejected'} "${request.title}".`, {
       referenceId: request.id,
@@ -3464,6 +4955,8 @@ export class OfficeSimulationEngine {
     if (request.status === 'approved') {
       request.status = 'fulfilled';
       request.updatedAt = nowIso();
+      this.markRequestReplyRead(employee.id, request.id);
+      this.markWorkflowRequestResolved(employee, request, true);
       action.status = 'done';
       employee.phase = 'working';
       employee.planVersion += 1;
@@ -3481,6 +4974,8 @@ export class OfficeSimulationEngine {
     if (request.status === 'rejected') {
       request.status = 'escalated';
       request.updatedAt = nowIso();
+      this.markRequestReplyRead(employee.id, request.id);
+      this.markWorkflowRequestResolved(employee, request, false);
       action.status = 'done';
       employee.phase = 'working';
       employee.planVersion += 1;
@@ -3513,6 +5008,8 @@ export class OfficeSimulationEngine {
 
   private applyPlan(employee: EmployeeRuntimeRecord, plan: TaskPlan, scripted: boolean) {
     const guardedPlan = applyPlaybookGuardrails(employee, plan);
+    const isWorkflowMicroPlan = guardedPlan.source === 'workflow';
+    this.clearRequestReplying(this.requestIdForPlan(employee.currentPlan));
     employee.planning = false;
     employee.plannerRetryAt = 0;
     employee.currentPlan = guardedPlan;
@@ -3521,6 +5018,7 @@ export class OfficeSimulationEngine {
     employee.objective = guardedPlan.objective;
     employee.lastUpdatedAt = nowIso();
     employee.planVersion += 1;
+    this.markOfficeRecordAssigned(guardedPlan.officeRecordId, employee.id);
 
     const firstAction = guardedPlan.actions[0];
     if (!firstAction) {
@@ -3528,22 +5026,25 @@ export class OfficeSimulationEngine {
       return;
     }
 
-    this.addMemory(employee.id, 'task', `${employee.name} started "${guardedPlan.title}".`, {
-      referenceId: guardedPlan.id,
-      relatedLocationId: firstAction.locationId,
-      importance: 2,
-    });
+    if (!isWorkflowMicroPlan) {
+      this.addMemory(employee.id, 'task', `${employee.name} started "${guardedPlan.title}".`, {
+        referenceId: guardedPlan.id,
+        relatedLocationId: firstAction.locationId,
+        importance: 2,
+      });
 
-    this.pushSystemLog(
-      scripted
-        ? `${employee.name} received scripted test plan "${guardedPlan.title}".`
-        : `${employee.name} started plan "${guardedPlan.title}".`,
-    );
-    this.logAgentEvent(
-      employee,
-      scripted ? 'Scripted Plan Started' : 'Plan Started',
-      `Objective: ${guardedPlan.objective}\n\nChecklist:\n${serializeChecklist(guardedPlan).map((item) => `- ${item}`).join('\n')}`,
-    );
+      this.pushSystemLog(
+        scripted
+          ? `${employee.name} received scripted test plan "${guardedPlan.title}".`
+          : `${employee.name} started plan "${guardedPlan.title}".`,
+      );
+      this.logAgentEvent(
+        employee,
+        scripted ? 'Scripted Plan Started' : 'Plan Started',
+        `Objective: ${guardedPlan.objective}\n\nChecklist:\n${serializeChecklist(guardedPlan).map((item) => `- ${item}`).join('\n')}`,
+      );
+    }
+    this.markRequestThreadActive(employee.id, this.requestIdForPlan(guardedPlan));
     this.syncLiveMemory(employee);
 
     if (firstAction.locationId === employee.currentLocationId) {
@@ -3601,6 +5102,7 @@ export class OfficeSimulationEngine {
   private completePlan(employee: EmployeeRuntimeRecord) {
     const finishedTitle = employee.taskTitle;
     const finishedPlan = employee.currentPlan;
+    const finishedRequestId = this.requestIdForPlan(finishedPlan);
     employee.currentPlan = null;
     employee.currentActionIndex = 0;
     employee.targetLocationId = null;
@@ -3609,39 +5111,69 @@ export class OfficeSimulationEngine {
     employee.status = `Holding at ${locationLabel(employee.currentLocationId)}`;
     employee.lastUpdatedAt = nowIso();
     employee.planVersion += 1;
-    employee.performance.completedPlans += 1;
-    employee.performance.qualityScore = normalizeQualityScore(employee.performance.qualityScore + 0.01);
+    if (finishedPlan && finishedPlan.source !== 'workflow') {
+      employee.performance.completedPlans += 1;
+      employee.performance.qualityScore = normalizeQualityScore(employee.performance.qualityScore + 0.01);
+      this.markOfficeRecordCompleted(finishedPlan.officeRecordId, employee.id);
+    }
 
-    this.addMemory(employee.id, 'task', `${employee.name} completed "${finishedTitle}".`, {
-      relatedLocationId: employee.currentLocationId,
-      importance: 2,
-    });
-    if (finishedPlan && finishedPlan.source !== 'test') {
+    const shouldRecordGenericCompletion = Boolean(finishedPlan && finishedPlan.source !== 'workflow');
+
+    if (shouldRecordGenericCompletion) {
+      this.addMemory(employee.id, 'task', `${employee.name} completed "${finishedTitle}".`, {
+        relatedLocationId: employee.currentLocationId,
+        importance: 2,
+      });
+    }
+    if (finishedPlan && finishedPlan.source !== 'workflow') {
+      this.rememberTaskCompletion(employee, finishedTitle, finishedPlan.source);
+    }
+    if (finishedPlan && finishedPlan.source !== 'test' && finishedPlan.source !== 'workflow') {
       this.maybeProposePlaybookPattern(employee, finishedTitle);
     }
-    this.storeLongTermMemory(employee, {
-      title: finishedTitle,
-      summary: `Completed at ${locationLabel(employee.currentLocationId)}.`,
-      details: [
-        `Objective: ${employee.objective}`,
-        finishedPlan ? `Final checklist:\n${serializeChecklist(finishedPlan).map((item) => `- ${item}`).join('\n')}` : '',
-      ]
-        .filter(Boolean)
-        .join('\n\n'),
-      kind: 'task',
-      tags: ['plan-complete', slugify(finishedTitle)],
-      importance: 2,
-      referenceId: finishedPlan?.id ?? null,
-      relatedLocationId: employee.currentLocationId,
-    });
-    this.logAgentEvent(
-      employee,
-      'Plan Completed',
-      `Completed "${finishedTitle}" at ${locationLabel(employee.currentLocationId)}.${finishedPlan ? `\n\nFinal checklist:\n${serializeChecklist(finishedPlan).map((item) => `- ${item}`).join('\n')}` : ''}`,
-    );
+    if (shouldRecordGenericCompletion) {
+      this.storeLongTermMemory(employee, {
+        title: finishedTitle,
+        summary: `Completed at ${locationLabel(employee.currentLocationId)}.`,
+        details: [
+          `Objective: ${employee.objective}`,
+          finishedPlan ? `Final checklist:\n${serializeChecklist(finishedPlan).map((item) => `- ${item}`).join('\n')}` : '',
+        ]
+          .filter(Boolean)
+          .join('\n\n'),
+        kind: 'task',
+        tags: ['plan-complete', slugify(finishedTitle)],
+        importance: 2,
+        referenceId: finishedPlan?.id ?? null,
+        relatedLocationId: employee.currentLocationId,
+      });
+      this.logAgentEvent(
+        employee,
+        'Plan Completed',
+        `Completed "${finishedTitle}" at ${locationLabel(employee.currentLocationId)}.${finishedPlan ? `\n\nFinal checklist:\n${serializeChecklist(finishedPlan).map((item) => `- ${item}`).join('\n')}` : ''}`,
+      );
+    }
+    if (finishedPlan && finishedPlan.source !== 'workflow') {
+      this.recordReflection(
+        employee,
+        `Reflection: ${finishedTitle}`,
+        `${employee.name} reflected on finishing "${finishedTitle}" at ${locationLabel(employee.currentLocationId)}.`,
+        [
+          `Objective: ${employee.objective}`,
+          finishedPlan ? `Final checklist:\n${serializeChecklist(finishedPlan).map((item) => `- ${item}`).join('\n')}` : '',
+          'Learned workflow: keep office work visible, collaborative when useful, and documented at the end of the pass.',
+        ]
+          .filter(Boolean)
+          .join('\n\n'),
+        ['reflection', 'office', finishedPlan.source, slugify(finishedTitle)],
+      );
+    }
+    this.clearRequestReplying(finishedRequestId);
     this.syncLiveMemory(employee);
     this.persistState();
-    this.pushSystemLog(`${employee.name} completed ${finishedTitle}.`);
+    if (shouldRecordGenericCompletion) {
+      this.pushSystemLog(`${employee.name} completed ${finishedTitle}.`);
+    }
   }
 
   private refreshStatus(employee: EmployeeRuntimeRecord) {
@@ -3792,6 +5324,62 @@ export class OfficeSimulationEngine {
       });
   }
 
+  private requestIdForPlan(plan: TaskPlan | null) {
+    if (!plan) {
+      return null;
+    }
+
+    return (
+      plan.actions.find((action) => action.type === 'resolve_request' && action.notes)?.notes ??
+      plan.actions.find((action) => action.requestId)?.requestId ??
+      null
+    );
+  }
+
+  private markRequestThreadActive(employeeId: EmployeeId, requestId: string | null) {
+    if (!requestId) {
+      return;
+    }
+
+    const request = this.requests.get(requestId);
+    if (!request || request.toId !== employeeId) {
+      return;
+    }
+
+    const now = nowIso();
+    request.readAt = request.readAt ?? now;
+    request.replyingAt = now;
+    request.updatedAt = now;
+  }
+
+  private clearRequestReplying(requestId: string | null) {
+    if (!requestId) {
+      return;
+    }
+
+    const request = this.requests.get(requestId);
+    if (!request) {
+      return;
+    }
+
+    request.replyingAt = null;
+    request.updatedAt = nowIso();
+  }
+
+  private markRequestReplyRead(employeeId: EmployeeId, requestId: string | null) {
+    if (!requestId) {
+      return;
+    }
+
+    const request = this.requests.get(requestId);
+    if (!request || request.fromId !== employeeId) {
+      return;
+    }
+
+    request.replyReadAt = nowIso();
+    request.updatedAt = nowIso();
+  }
+
   private recentTaskMemories(employee: EmployeeRuntimeRecord, limit = 8) {
     return [...employee.activeMemory, ...employee.passiveMemory]
       .filter((memory) => memory.kind === 'task' || memory.kind === 'context')
@@ -3934,12 +5522,20 @@ export class OfficeSimulationEngine {
       return null;
     }
 
+    const localModelPreferred =
+      (isLoopbackBaseUrl(this.planner.baseUrl) || this.planner.model.includes(':')) &&
+      typeof employee.preferredModel === 'string' &&
+      employee.preferredModel.includes(':');
+    const preferredLocalModel = localModelPreferred ? employee.preferredModel : null;
     const useConfiguredModelOnly =
-      isLoopbackBaseUrl(this.planner.baseUrl) || this.planner.model.includes(':') || !supportsRoleModel(this.planner.model);
-    let chosenModel =
-      !useConfiguredModelOnly && employee.preferredModel && supportsRoleModel(employee.preferredModel)
+      (isLoopbackBaseUrl(this.planner.baseUrl) || this.planner.model.includes(':')) && !localModelPreferred
+        ? true
+        : (!localModelPreferred && !supportsRoleModel(this.planner.model));
+    let chosenModel: string =
+      preferredLocalModel ??
+      (!useConfiguredModelOnly && employee.preferredModel && supportsRoleModel(employee.preferredModel)
         ? employee.preferredModel
-        : this.planner.model;
+        : this.planner.model);
 
     // The current proxy stack reliably serves GPT-5.4/5.3, but will sometimes
     // answer gpt-4o-mini requests as gpt-5-mini, which trips strict model
@@ -4129,6 +5725,7 @@ export class OfficeSimulationEngine {
           'Return only the JSON object that matches the provided schema.',
           'Keep draftFocus short and concrete.',
           'Customer Relations owns the case. General Manager is the only internal approver. The Red Terminal / owner is above the General Manager.',
+          'Simple informational emails should stay simple: no helpers and no GM approval unless money, policy, exceptions, or real risk are involved.',
           'Quality Assurance is advisory only. React A, B, C, and D are a reaction team that can help when genuinely needed.',
           REDUCED_ROSTER_TEST_MODE ? REDUCED_ROSTER_NOTE : '',
           'Only include helpers if they materially improve the packet. Do not add React help to a pure finance/policy refund unless the case is genuinely cross-functional.',
@@ -4247,6 +5844,7 @@ export class OfficeSimulationEngine {
             : fallback.ownerEscalationLikely,
       helpers,
       draftFocus,
+      categoryTags: [...fallback.categoryTags],
     };
   }
 
@@ -4295,7 +5893,7 @@ export class OfficeSimulationEngine {
         ? employee.privateNotes.slice(0, 5).map((note) => `- ${note.title}: ${note.summary}`).join('\n')
         : '';
     const pendingEmails =
-      employee.department === 'service'
+      canHandleInbox(employee)
         ? this.pendingInboxEmails()
             .slice(0, 4)
             .map((email) => `- ${email.subject} from ${email.from}: ${email.summary}`)
@@ -4323,8 +5921,8 @@ export class OfficeSimulationEngine {
           'After bootstrapping, move on to concrete work. Do not keep repeating startup rituals, task-board checks, or archive-only loops unless new information arrived.',
           'If a leadership sync already happened recently, use it as context and choose a concrete next initiative with a visible deliverable.',
           'Free time should become substantive work: investigate active projects, clean up process gaps, update the playbook with a real proposal, review client/project context, or produce a specific office improvement.',
-          'Inbox email lives in the Email Simulator inbox. Customer Relations should review_email, draft_email, and send_email from the customer-relations desk.',
-          'Simple customer emails can be handled solo, but the final outgoing send still needs General Manager approval.',
+          'Inbox email lives in the Email Simulator inbox. Any employee temporarily covering inbox work should review_email, draft_email, and send_email from the customer-relations desk.',
+          'Simple customer emails can be handled solo without internal approval. Use General Manager approval only for money, policy, exception, or higher-risk outgoing responses.',
           'Complex customer emails should split work across helpers, gather second opinions or advisory reviews, then stitch the packet together before asking the General Manager for final approval.',
           'Use request_review and second_opinion for advisory collaboration. Use ask_permission only for General Manager final approval.',
           'Avoid reciprocal review loops. If the employee is already handling a review or approval context, resolve it instead of creating another review request back.',
