@@ -3141,7 +3141,18 @@ export class OfficeSimulationEngine {
     }
   }
 
-  private recordReflection(employee: EmployeeRuntimeRecord, title: string, summary: string, details: string, tags: string[]) {
+  private recordReflection(
+    employee: EmployeeRuntimeRecord,
+    title: string,
+    summary: string,
+    details: string,
+    tags: string[],
+    options?: {
+      referenceId?: string | null;
+      relatedLocationId?: OfficeLocationId | null;
+      relatedEmployeeId?: EmployeeId | null;
+    },
+  ) {
     employee.workflowHabits.reflections.push({
       id: randomUUID(),
       createdAt: nowIso(),
@@ -3160,6 +3171,9 @@ export class OfficeSimulationEngine {
       kind: 'note',
       tags,
       importance: 2,
+      referenceId: options?.referenceId ?? null,
+      relatedLocationId: options?.relatedLocationId ?? null,
+      relatedEmployeeId: options?.relatedEmployeeId ?? null,
     });
   }
 
@@ -3320,7 +3334,10 @@ export class OfficeSimulationEngine {
       .map((entry) => entry.employeeId);
 
     this.rememberTaskCompletion(employee, `Inbox: ${workflow.subject}`, 'email-workflow');
-    this.recordReflection(employee, `Reflection: Inbox: ${workflow.subject}`, summary, details, ['reflection', 'workflow', 'email', patternKey]);
+    this.recordReflection(employee, `Reflection: Inbox: ${workflow.subject}`, summary, details, ['reflection', 'workflow', 'email', patternKey], {
+      referenceId: workflow.emailId,
+      relatedLocationId: employee.assignedLocationId,
+    });
   }
 
   private finalizeRequestWorkflow(employee: EmployeeRuntimeRecord, workflow: RequestWorkflowState, request: OfficeRequest | null) {
@@ -3336,7 +3353,11 @@ export class OfficeSimulationEngine {
     ].join('\n');
 
     this.rememberTaskCompletion(employee, `Handle ${workflow.kind}`, 'request-workflow');
-    this.recordReflection(employee, `Reflection: Handle ${workflow.kind}`, summary, details, ['reflection', 'workflow', 'request', workflow.kind]);
+    this.recordReflection(employee, `Reflection: Handle ${workflow.kind}`, summary, details, ['reflection', 'workflow', 'request', workflow.kind], {
+      referenceId: workflow.requestId,
+      relatedLocationId: request?.locationId ?? employee.currentLocationId,
+      relatedEmployeeId: request?.fromId ?? null,
+    });
   }
 
   private pendingInboxEmails() {
