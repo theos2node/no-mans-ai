@@ -381,6 +381,8 @@ export function validateScenarioCausality(scenario: ScenarioDefinition): void {
   const requests = new Map<string, ScenarioStep>();
   const resolved = new Set<string>();
   const draftKeys = new Set<string>();
+  const sentInboxIds = new Set<string>();
+  const archivedInboxIds = new Set<string>();
   for (const step of scenario.steps) {
     if (step.action === "ask_permission" || step.action === "request_review") {
       requests.set(step.requestKey!, step);
@@ -406,6 +408,9 @@ export function validateScenarioCausality(scenario: ScenarioDefinition): void {
       draftKeys.add(`${step.inboxId}:${step.emailSubject}`);
     }
     if (step.action === "send_email") {
+      if (sentInboxIds.has(step.inboxId!)) {
+        fail(`send_email repeats inbox side effect ${step.inboxId}`);
+      }
       if (!draftKeys.has(`${step.inboxId}:${step.emailSubject}`)) {
         fail(`send_email has no matching draft for ${step.inboxId}`);
       }
@@ -421,6 +426,13 @@ export function validateScenarioCausality(scenario: ScenarioDefinition): void {
       if (!approved) {
         fail(`send_email requires approved request ${step.requestKey}`);
       }
+      sentInboxIds.add(step.inboxId!);
+    }
+    if (step.action === "archive_note") {
+      if (archivedInboxIds.has(step.inboxId!)) {
+        fail(`archive_note repeats inbox side effect ${step.inboxId}`);
+      }
+      archivedInboxIds.add(step.inboxId!);
     }
   }
 }

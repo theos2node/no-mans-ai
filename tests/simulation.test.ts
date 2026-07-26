@@ -113,6 +113,18 @@ describe("deterministic refund scenario", () => {
         ),
       })
     ).not.toThrow();
+    for (const action of ["send_email", "archive_note"] as const) {
+      const original = scenario.steps.find((step) => step.action === action)!;
+      expect(() =>
+        validateScenario({
+          ...scenario,
+          steps: [
+            ...scenario.steps,
+            { ...original, id: `${original.id}-duplicate` },
+          ],
+        })
+      ).toThrow(/repeats inbox side effect/);
+    }
   });
 
   it("satisfies approval, outgoing email, and archival goals without implicit record selection", () => {

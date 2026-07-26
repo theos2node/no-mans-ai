@@ -48,6 +48,8 @@ npm run dev
 
 Open [http://localhost:5173](http://localhost:5173). The API listens on port `8787` by default, and Vite proxies `/api` and `/events` to it.
 
+The copied environment keeps live model and vault access disabled. After reviewing the synthetic vault and planner configuration, set `ENABLE_LIVE_MODE=true` in `.env` to enable the live dashboard routes. Deterministic scenario and replay routes remain available either way.
+
 ## Live planner configuration
 
 `.env.example` is configured for a local OpenAI-compatible endpoint. The important settings are:
@@ -62,7 +64,7 @@ Open [http://localhost:5173](http://localhost:5173). The API listens on port `87
 | `PLANNER_RETRY_BACKOFF_MS` | Cooldown after planner failures |
 | `OPENAI_INPUT_COST_PER_1M` | Optional dashboard cost estimate |
 | `OPENAI_OUTPUT_COST_PER_1M` | Optional dashboard cost estimate |
-| `ENABLE_LIVE_MODE` | Explicitly enables model- and vault-backed routes |
+| `ENABLE_LIVE_MODE` | Explicitly enables model- and vault-backed routes; defaults to `false` |
 | `HOST` | API bind host; defaults to `127.0.0.1` |
 
 The planner queue is serialized, throttled, retried with backoff, and cooled by a circuit breaker so a local model is not hit concurrently or in a tight failure loop.

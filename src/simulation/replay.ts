@@ -50,6 +50,8 @@ export function validateReplay(
   const emailIds = new Set<string>();
   const archiveIds = new Set<string>();
   const emittedSideEffects = new Set<string>();
+  const sentInboxIds = new Set<string>();
+  const archivedInboxIds = new Set<string>();
   const steps = new Map(scenario.steps.map((step) => [step.id, step]));
   const executed = new Set<string>();
   const drafts = new Set<string>();
@@ -138,6 +140,7 @@ export function validateReplay(
       if (
         emailIds.has(emailId) || !item || !step ||
         step.action !== "send_email" || emittedSideEffects.has(step.id) ||
+        sentInboxIds.has(String(event.payload.inboxId)) ||
         !executed.has(step.id) ||
         step.inboxId !== event.payload.inboxId ||
         step.emailSubject !== event.payload.subject ||
@@ -147,6 +150,7 @@ export function validateReplay(
       ) reject("email lacks matching inbox, draft, and approved request");
       emailIds.add(emailId);
       emittedSideEffects.add(step.id);
+      sentInboxIds.add(String(event.payload.inboxId));
     }
     if (event.type === "item.archived") {
       const archiveId = String(event.payload.archiveId);
@@ -155,6 +159,7 @@ export function validateReplay(
       if (
         archiveIds.has(archiveId) || !item || !step ||
         step.action !== "archive_note" || emittedSideEffects.has(step.id) ||
+        archivedInboxIds.has(String(event.payload.inboxId)) ||
         !executed.has(step.id) ||
         step.inboxId !== event.payload.inboxId ||
         step.actorId !== event.actorId ||
@@ -162,6 +167,7 @@ export function validateReplay(
       ) reject("archive does not identify matching inbox item");
       archiveIds.add(archiveId);
       emittedSideEffects.add(step.id);
+      archivedInboxIds.add(String(event.payload.inboxId));
     }
   }
   if (finished && executed.size < scenario.steps.length) {
