@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { PNG } from 'pngjs';
 
@@ -10,47 +11,37 @@ const BG_TOLERANCE = 42;
 const SPRITE_PADDING = 6;
 const TARGET_SPRITE_HEIGHT = 82;
 const MAX_SLOT_CONTENT = 104;
+const ROOT_DIR = fileURLToPath(new URL('..', import.meta.url));
+const sourceDirectoryArgument = process.argv[2] ?? process.env.SPRITE_SOURCE_DIR;
 
-const jobs = [
-  {
-    input: '/Users/theo_primary/Desktop/Screenshot 2026-03-21 at 4.45.47 AM.png',
-    output: path.resolve('src/assets/sam-walk.png'),
-  },
-  {
-    input: '/Users/theo_primary/Desktop/Screenshot 2026-03-21 at 4.47.31 AM.png',
-    output: path.resolve('src/assets/jeremy-walk.png'),
-  },
-  {
-    input: '/Users/theo_primary/Desktop/Screenshot 2026-03-25 at 11.34.31 PM.png',
-    output: path.resolve('src/assets/june-liaison-walk.png'),
-  },
-  {
-    input: '/Users/theo_primary/Desktop/Screenshot 2026-03-25 at 11.33.59 PM.png',
-    output: path.resolve('src/assets/ellis-accounting-walk.png'),
-  },
-  {
-    input: '/Users/theo_primary/Desktop/Screenshot 2026-03-25 at 11.33.40 PM.png',
-    output: path.resolve('src/assets/nia-service-walk.png'),
-  },
-  {
-    input: '/Users/theo_primary/Desktop/Screenshot 2026-03-25 at 11.33.32 PM.png',
-    output: path.resolve('src/assets/rowan-manager-walk.png'),
-  },
-  {
-    input: '/Users/theo_primary/Desktop/Screenshot 2026-03-25 at 11.33.23 PM.png',
-    output: path.resolve('src/assets/petra-quality-walk.png'),
-  },
-  {
-    input: '/Users/theo_primary/Desktop/Screenshot 2026-03-25 at 11.33.13 PM.png',
-    output: path.resolve('src/assets/ava-react-a-walk.png'),
-  },
-  {
-    input: '/Users/theo_primary/Desktop/Screenshot 2026-03-25 at 11.32.57 PM.png',
-    output: path.resolve('src/assets/milo-react-b-walk.png'),
-  },
+if (!sourceDirectoryArgument) {
+  throw new Error(
+    'Provide a source directory: npm run build:sprites -- ./path/to/source-strips ' +
+      'or set SPRITE_SOURCE_DIR.',
+  );
+}
+
+const sourceDirectory = path.resolve(sourceDirectoryArgument);
+const outputDirectory = path.resolve(
+  process.env.SPRITE_OUTPUT_DIR ?? path.join(ROOT_DIR, 'src/assets'),
+);
+const spriteNames = [
+  'sam',
+  'jeremy',
+  'june-liaison',
+  'ellis-accounting',
+  'nia-service',
+  'rowan-manager',
+  'petra-quality',
+  'ava-react-a',
+  'milo-react-b',
 ];
+const jobs = spriteNames.map((name) => ({
+  input: path.join(sourceDirectory, `${name}.png`),
+  output: path.join(outputDirectory, `${name}-walk.png`),
+}));
 
-await fs.promises.mkdir(path.resolve('src/assets'), { recursive: true });
+await fs.promises.mkdir(outputDirectory, { recursive: true });
 
 for (const job of jobs) {
   const png = PNG.sync.read(fs.readFileSync(job.input));

@@ -1,52 +1,147 @@
 # No Man's AI
 
-No Man's AI is an observable laboratory for LLM-directed office simulations. It combines a pixel-office operator surface, a live planner backed by a local or OpenAI-compatible model, an Obsidian-style vault, and a deterministic experiment path for repeatable research.
+[![CI](https://github.com/theos2node/no-mans-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/theos2node/no-mans-ai/actions/workflows/ci.yml)
+[![MIT License](https://img.shields.io/badge/license-MIT-4c8bf5.svg)](LICENSE)
+[![Node.js 22.18+](https://img.shields.io/badge/node-%3E%3D22.18-5fa04e.svg)](package.json)
+[![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178c6.svg)](tsconfig.json)
+
+An observable laboratory for LLM-directed office simulations. No Man's AI combines a pixel-office operator surface, a live model-backed planner, an Obsidian-style knowledge vault, and a deterministic experiment runner for repeatable research.
+
+![No Man's AI pixel office dashboard](docs/no-mans-ai.jpg)
+
+## Why this exists
+
+Agent demos often hide the useful parts: what the agents decided, why they waited, which request unlocked an action, and whether a run can be reproduced. No Man's AI makes those mechanics inspectable.
+
+- Watch workers move, plan, request approval, send email, and archive outcomes.
+- Use an OpenAI-compatible endpoint or local Ollama deployment for live planning.
+- Persist shared knowledge and per-agent memory as readable Markdown.
+- Run seeded, fixture-driven experiments without model calls or vault writes.
+- Replay strict canonical event streams and derive results from the log.
+
+## Two execution modes
+
+| Mode | Planner | Persistence | Best for |
+| --- | --- | --- | --- |
+| Live office | Local or OpenAI-compatible model | Markdown vault and runtime state | Observing emergent workflows |
+| Deterministic experiment | Versioned scenario + seeded runtime | In-memory canonical events | Tests, evaluation, and regression analysis |
+
+The deterministic path is intentionally isolated from the live planner. It never calls a model and never mutates `the archives/No man's AI` or `data/office-runtime.json`.
 
 ## Quick start
 
+Requires Node.js 22.18 or newer.
+
 ```bash
+git clone https://github.com/theos2node/no-mans-ai.git
+cd no-mans-ai
 npm install
-npm run api   # API: http://localhost:8787
-npm run dev   # UI: http://localhost:5173
+cp .env.example .env
 ```
 
-The live planner is opt-in through environment variables such as `OPENAI_API_KEY`, `OPENAI_BASE_URL`, and `OPENAI_MODEL`. Do not put secrets in the repository.
+Start the API and UI in separate terminals:
 
-## Deterministic and live modes
+```bash
+npm run api
+npm run dev
+```
 
-Live mode preserves the existing office experience: employees plan through the configured model, progress through requests and email, and persist useful memory into `the archives/No man's AI`. Deterministic mode is a fixture-driven laboratory. It uses a versioned scenario, seeded random values, a logical clock, deterministic IDs, and canonical events. It makes no model calls and does not mutate the vault or `data/office-runtime.json`.
+Open [http://localhost:5173](http://localhost:5173). The API listens on port `8787` by default, and Vite proxies `/api` and `/events` to it.
 
-Run the included scenario:
+## Live planner configuration
+
+`.env.example` is configured for a local OpenAI-compatible endpoint. The important settings are:
+
+| Variable | Purpose |
+| --- | --- |
+| `OPENAI_API_KEY` | Credential or local placeholder such as `ollama` |
+| `OPENAI_BASE_URL` | OpenAI-compatible `/v1` endpoint |
+| `OPENAI_MODEL` | Model used by live workers |
+| `PLANNER_REQUEST_TIMEOUT_MS` | Planner request timeout |
+| `PLANNER_MIN_REQUEST_GAP_MS` | Minimum delay between serialized requests |
+| `PLANNER_RETRY_BACKOFF_MS` | Cooldown after planner failures |
+| `OPENAI_INPUT_COST_PER_1M` | Optional dashboard cost estimate |
+| `OPENAI_OUTPUT_COST_PER_1M` | Optional dashboard cost estimate |
+
+The planner queue is serialized, throttled, retried with backoff, and cooled by a circuit breaker so a local model is not hit concurrently or in a tight failure loop.
+
+The optional `npm run proxy` helper expects `LOCAL_OPENAI_PROXY_APP` and `LOCAL_OPENAI_PROXY_ENV`. Its virtual environment defaults to `.proxy-venv` and can be overridden with `LOCAL_OPENAI_PROXY_VENV`.
+
+## Deterministic experiments
+
+Run the included refund-approval scenario:
 
 ```bash
 npm run scenario -- refund-approval
 npm run scenario -- refund-approval --json
 ```
 
-The same scenario name, seed, and run ID produce byte-identical canonical JSON. The example covers inbox review, policy/archive lookup, manager approval, outgoing email, and archival.
+The same scenario, seed, and run ID produce byte-identical canonical JSON. The fixture covers inbox review, archive lookup, manager approval, drafting, sending, and archival.
 
-Deterministic events use schema version 1. Every event has the exact envelope `{ schemaVersion, runId, scenarioId, scenarioVersion, sequence, tick, type, actorId, payload }`. Streams require sequential sequences, nondecreasing integer ticks, one `run.started`, and at most one final `run.finished`; replay also checks scenario identity, seed, actors, locations, actions, payloads, and causal inbox/request references. In-progress streams are replayable.
+Every schema-v1 event has the envelope:
 
-## Experiment API
+```text
+{ schemaVersion, runId, scenarioId, scenarioVersion,
+  sequence, tick, type, actorId, payload }
+```
 
-The existing live routes remain available: `/api/start`, `/api/stop`, `/api/reset`, `/api/test`, `/api/employees`, and `/events`. Deterministic runs add:
+Replay enforces sequential sequence numbers, nondecreasing logical ticks, run and scenario identity, lifecycle rules, actor/action validity, exact payload shapes, and causal inbox/request references. In-progress streams can also be replayed.
+
+### Experiment API
 
 ```text
 POST /api/runs                 create and start a run
-GET  /api/runs/:runId          read run state, events, and metrics
+GET  /api/runs/:runId          read state, events, and metrics
 POST /api/runs/:runId/step     execute one fixture step
 POST /api/runs/:runId/finish   finish the current run
 GET  /api/runs/:runId/events   read canonical events
 POST /api/replay               rebuild public state from scenario + events
 ```
 
-`POST /api/runs` accepts `{ "scenarioId": "refund-approval", "runId": "optional-id", "seed": 424242 }`. The replay endpoint rejects malformed, out-of-order, or post-finish streams.
+`POST /api/runs` accepts:
 
-HTTP JSON bodies are limited to 256 KiB, run IDs must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`, duplicate run IDs return 409, and only the newest 100 deterministic runs are retained. Retention uses bounded insertion-order eviction of the oldest run when the cap is reached. Deterministic routes are isolated from the live planner and vault.
+```json
+{
+  "scenarioId": "refund-approval",
+  "runId": "optional-run-id",
+  "seed": 424242
+}
+```
 
-## Architecture and reproducibility
+JSON bodies are limited to 256 KiB. Run IDs are validated, duplicates return `409`, and only the newest 100 deterministic runs are retained in memory.
 
-Live orchestration remains in `src/api/simulationEngine.ts`. Deterministic experiment modules live under `src/simulation/`: strict scenario validation, runtime primitives, canonical events, the runner, metrics, and replay projection. The public state is derived from events, so a saved event stream can be inspected or replayed independently of the live engine.
+## Architecture
+
+```mermaid
+flowchart LR
+  UI["React pixel-office UI"] --> API["Node HTTP API"]
+  API --> Live["Live office engine"]
+  Live --> Model["OpenAI-compatible model"]
+  Live --> Vault["Markdown knowledge vault"]
+
+  Scenario["Versioned scenario"] --> Runner["Seeded deterministic runner"]
+  API --> Runner
+  Runner --> Events["Canonical event stream"]
+  Events --> Replay["Strict replay projection"]
+  Events --> Metrics["Derived evaluation metrics"]
+```
+
+The live and deterministic paths share the office vocabulary while keeping inference and persistence out of repeatable evaluation runs.
+
+## Repository map
+
+```text
+src/App.tsx                    operator dashboard and pixel office
+src/api/simulationEngine.ts    live planner and office workflow engine
+src/api/obsidianVault.ts       Markdown-backed memory and knowledge storage
+src/simulation/                deterministic runner, events, replay, metrics
+scenarios/                     versioned experiment fixtures
+scripts/run-scenario.ts        deterministic CLI
+tests/simulation.test.ts       replay, lifecycle, causality, and HTTP tests
+the archives/No man's AI/      bundled synthetic demo vault
+```
+
+The bundled archive is synthetic demonstration data. Do not replace it with personal, customer, or production content.
 
 ## Development
 
@@ -55,10 +150,21 @@ npm run check
 npm test
 npm run build
 npm run ci
+npm audit
 ```
 
-## Data safety and limitations
+To rebuild walking sprites, provide a directory containing the expected named source strips:
 
-The project is a local development prototype. The HTTP API has no authentication, and live mode can write to the configured vault. Review environment configuration before running it around sensitive data. Deterministic scenarios currently use a small declarative action vocabulary and do not emulate model-generated plans, token consumption, or full vault contents; those are deliberate follow-up areas.
+```bash
+npm run build:sprites -- ./path/to/source-strips
+```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and [LICENSE](LICENSE).
+## Security and project status
+
+This is an experimental local application, not a hardened multi-user service. The HTTP API has no authentication, and live mode can write to the configured vault. Do not expose it to an untrusted network or run it against sensitive data without adding access controls and reviewing the persistence model.
+
+Deterministic scenarios currently use a compact declarative action vocabulary. They do not emulate model-generated plans, token use, or full vault contents.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution expectations and [SECURITY.md](SECURITY.md) for private vulnerability reporting guidance.
+
+Released under the [MIT License](LICENSE).
