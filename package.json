@@ -1,8 +1,29 @@
 {
   "name": "no-mans-ai",
   "version": "0.1.0",
-  "description": "Office simulation prototype",
-  "private": true,
+  "description": "Observable laboratory for LLM-directed office simulations",
+  "private": false,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/theos2node/no-mans-ai.git"
+  },
+  "bugs": {
+    "url": "https://github.com/theos2node/no-mans-ai/issues"
+  },
+  "homepage": "https://github.com/theos2node/no-mans-ai#readme",
+  "keywords": [
+    "agent-simulation",
+    "deterministic-replay",
+    "llm",
+    "multi-agent",
+    "ollama",
+    "react",
+    "typescript"
+  ],
+  "engines": {
+    "node": ">=22.18"
+  },
   "type": "module",
   "scripts": {
     "api": "node src/api/server.ts",
@@ -10,29 +31,25 @@
     "build": "vite build",
     "build:sprites": "node scripts/build-sprites.mjs",
     "check": "tsc --noEmit",
+    "test": "vitest run",
+    "scenario": "node scripts/run-scenario.ts",
+    "ci": "npm run check && npm test && npm run build && npm run scenario -- refund-approval --json",
     "preview": "vite preview",
     "proxy": "./scripts/run-local-openai-proxy.sh"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.39.0",
-    "@types/react": "^19.2.14",
-    "@types/react-dom": "^19.2.3",
-    "@vitejs/plugin-react": "^6.0.1",
-    "chalk": "^4.1.2",
-    "dotenv": "^17.3.1",
-    "openai": "^4.80.0",
-    "ora": "^5.4.1",
-    "react": "^19.2.4",
-    "react-dom": "^19.2.4",
-    "uuid": "^11.1.0",
-    "vite": "^8.0.2",
-    "yaml": "^2.7.0"
+    "dotenv": "^17.4.2",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
-    "@types/uuid": "^10.0.0",
+    "@types/node": "^22.20.1",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.4",
     "pngjs": "^7.0.0",
-    "typescript": "^5.7.0",
-    "vitest": "^3.0.0"
+    "typescript": "^5.9.3",
+    "vite": "^8.1.5",
+    "vitest": "^4.1.10"
   }
 }

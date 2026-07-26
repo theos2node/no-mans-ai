@@ -1,90 +1,174 @@
 # No Man's AI
 
-Office simulation sandbox for testing LLM-directed workers inside a shared pixel office. The current build couples a React control surface, a Node simulation engine, local Ollama/OpenAI-compatible planning, and an Obsidian-style vault that stores shared knowledge, playbook proposals, and per-agent logs.
+[![CI](https://github.com/theos2node/no-mans-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/theos2node/no-mans-ai/actions/workflows/ci.yml)
+[![MIT License](https://img.shields.io/badge/license-MIT-4c8bf5.svg)](LICENSE)
+[![Node.js 22.18+](https://img.shields.io/badge/node-%3E%3D22.18-5fa04e.svg)](package.json)
+[![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178c6.svg)](tsconfig.json)
 
-## Current State
+An observable laboratory for LLM-directed office simulations. No Man's AI combines a pixel-office operator surface, a live model-backed planner, an Obsidian-style knowledge vault, and a deterministic experiment runner for repeatable research.
 
-- interactive office map with animated movement, route playback, crowd-aware sprite offsets, and editable layout anchors
-- dashboard view with live employee state, request queues, model usage, and runtime controls
-- backend workflow engine for planning, approvals, peer requests, inbox handling, and office task execution
-- local LLM support through an OpenAI-compatible endpoint or Ollama native structured output
-- single-flight planner queue with request gap, retry backoff, and circuit-breaker cooling so local models are not overloaded
-- vault-backed archive under `the archives/No man's AI` for shared knowledge, playbook proposals, and agent logs
-- current testing roster is reduced to Sam and Jeremy so a local model can be exercised without the full office generating excessive traffic
+![No Man's AI pixel office dashboard](docs/no-mans-ai.jpg)
 
-## Main Files
+## Why this exists
 
-```text
-src/App.tsx
-src/styles.css
-src/officeNavigation.ts
-src/default-layout.json
-src/api/server.ts
-src/api/simulationEngine.ts
-src/api/obsidianVault.ts
-scripts/run-local-openai-proxy.sh
-the archives/No man's AI/
-```
+Agent demos often hide the useful parts: what the agents decided, why they waited, which request unlocked an action, and whether a run can be reproduced. No Man's AI makes those mechanics inspectable.
 
-## Run
+- Watch workers move, plan, request approval, send email, and archive outcomes.
+- Use an OpenAI-compatible endpoint or local Ollama deployment for live planning.
+- Persist shared knowledge and per-agent memory as readable Markdown.
+- Run seeded, fixture-driven experiments without model calls or vault writes.
+- Replay strict canonical event streams and derive results from the log.
+
+## Two execution modes
+
+| Mode | Planner | Persistence | Best for |
+| --- | --- | --- | --- |
+| Live office | Local or OpenAI-compatible model | Markdown vault and runtime state | Observing emergent workflows |
+| Deterministic experiment | Versioned scenario + seeded runtime | In-memory canonical events | Tests, evaluation, and regression analysis |
+
+The deterministic path is intentionally isolated from the live planner. It never calls a model and never mutates `the archives/No man's AI` or `data/office-runtime.json`.
+
+## Quick start
+
+Requires Node.js 22.18 or newer.
 
 ```bash
+git clone https://github.com/theos2node/no-mans-ai.git
+cd no-mans-ai
 npm install
+cp .env.example .env
+```
+
+Start the API and UI in separate terminals:
+
+```bash
 npm run api
 npm run dev
 ```
 
-Open [http://localhost:5173](http://localhost:5173).
+Open [http://localhost:5173](http://localhost:5173). The API listens on port `8787` by default, and Vite proxies `/api` and `/events` to it.
 
-The API server runs on [http://localhost:8787](http://localhost:8787).
+The copied environment keeps live model and vault access disabled. After reviewing the synthetic vault and planner configuration, set `ENABLE_LIVE_MODE=true` in `.env` to enable the live dashboard routes. Deterministic scenario and replay routes remain available either way.
 
-## Live Planner Config
+## Live planner configuration
 
-Use these env vars for local or remote live planning:
+`.env.example` is configured for a local OpenAI-compatible endpoint. The important settings are:
+
+| Variable | Purpose |
+| --- | --- |
+| `OPENAI_API_KEY` | Credential or local placeholder such as `ollama` |
+| `OPENAI_BASE_URL` | OpenAI-compatible `/v1` endpoint |
+| `OPENAI_MODEL` | Model used by live workers |
+| `PLANNER_REQUEST_TIMEOUT_MS` | Planner request timeout |
+| `PLANNER_MIN_REQUEST_GAP_MS` | Minimum delay between serialized requests |
+| `PLANNER_RETRY_BACKOFF_MS` | Cooldown after planner failures |
+| `OPENAI_INPUT_COST_PER_1M` | Optional dashboard cost estimate |
+| `OPENAI_OUTPUT_COST_PER_1M` | Optional dashboard cost estimate |
+| `ENABLE_LIVE_MODE` | Explicitly enables model- and vault-backed routes; defaults to `false` |
+| `HOST` | API bind host; defaults to `127.0.0.1` |
+
+The planner queue is serialized, throttled, retried with backoff, and cooled by a circuit breaker so a local model is not hit concurrently or in a tight failure loop.
+
+The optional `npm run proxy` helper expects `LOCAL_OPENAI_PROXY_APP` and `LOCAL_OPENAI_PROXY_ENV`. Its virtual environment defaults to `.proxy-venv` and can be overridden with `LOCAL_OPENAI_PROXY_VENV`.
+
+## Deterministic experiments
+
+Run the included refund-approval scenario:
 
 ```bash
-OPENAI_API_KEY=ollama
-OPENAI_BASE_URL=http://127.0.0.1:11435/v1
-OPENAI_MODEL=gemma4:e4b
-PLANNER_REQUEST_TIMEOUT_MS=120000
-PLANNER_MIN_REQUEST_GAP_MS=1500
-PLANNER_RETRY_BACKOFF_MS=20000
-OPENAI_INPUT_COST_PER_1M=
-OPENAI_OUTPUT_COST_PER_1M=
+npm run scenario -- refund-approval
+npm run scenario -- refund-approval --json
 ```
 
-Notes:
+The same scenario, seed, and run ID produce byte-identical canonical JSON. The fixture covers inbox review, archive lookup, manager approval, drafting, sending, and archival.
 
-- `OPENAI_BASE_URL` can point at an OpenAI-compatible proxy or the local Ollama tunnel.
-- `Run` uses the live planner; `Test` is still useful for verifying movement and UI behavior without spending model calls.
-- The planner queue is serialized, throttled, and backed off after failures so a local server is not hit concurrently or in a tight retry loop.
-- Structured output support is used when talking to Ollama natively so plans come back as machine-readable JSON instead of prompt-shaped free text.
+Every schema-v1 event has the envelope:
 
-## Vault Layout
+```text
+{ schemaVersion, runId, scenarioId, scenarioVersion,
+  sequence, tick, type, actorId, payload }
+```
 
-The Obsidian-style vault lives in `the archives/No man's AI` and now stores agent memory under per-agent workspaces:
+Replay enforces sequential sequence numbers, nondecreasing logical ticks, run and scenario identity, lifecycle rules, actor/action validity, exact payload shapes, and causal inbox/request references. In-progress streams can also be replayed.
 
-- `Agents/<name>/live-memory.md` for the tiny current-memory snapshot
-- `Agents/<name>/long-term-memory/` for structured searchable memory notes
-- `Agents/<name>/agent-log/` for chronological activity logs
-- `Agents/<name>/legacy-notes/` for migrated older desk-note material
-- `Knowledge Base/Shared Knowledge/` for archived outcomes and shared office context
-- `Playbook/Proposals/` for candidate workflows discovered during repeated runs
+### Experiment API
 
-## API
+```text
+POST /api/runs                 create and start a run
+GET  /api/runs/:runId          read state, events, and metrics
+POST /api/runs/:runId/step     execute one fixture step
+POST /api/runs/:runId/finish   finish the current run
+GET  /api/runs/:runId/events   read canonical events
+POST /api/replay               rebuild public state from scenario + events
+```
 
-- `GET /api/health`
-- `GET /api/status`
-- `GET /api/meta`
-- `GET /api/employees`
-- `POST /api/start`
-- `POST /api/stop`
-- `POST /api/reset`
-- `POST /api/test`
-- `POST /api/employees/sync`
-- `GET /events`
+`POST /api/runs` accepts:
 
-## Notes
+```json
+{
+  "scenarioId": "refund-approval",
+  "runId": "optional-run-id",
+  "seed": 424242
+}
+```
 
-- The frontend is the operator surface; the backend owns planning, task progression, and persistence into the vault.
-- This repository is actively evolving toward stronger agent memory and less repetitive office behavior.
+JSON bodies are limited to 256 KiB. Run IDs are validated, duplicates return `409`, and only the newest 100 deterministic runs are retained in memory.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  UI["React pixel-office UI"] --> API["Node HTTP API"]
+  API --> Live["Live office engine"]
+  Live --> Model["OpenAI-compatible model"]
+  Live --> Vault["Markdown knowledge vault"]
+
+  Scenario["Versioned scenario"] --> Runner["Seeded deterministic runner"]
+  API --> Runner
+  Runner --> Events["Canonical event stream"]
+  Events --> Replay["Strict replay projection"]
+  Events --> Metrics["Derived evaluation metrics"]
+```
+
+The live and deterministic paths share the office vocabulary while keeping inference and persistence out of repeatable evaluation runs.
+
+## Repository map
+
+```text
+src/App.tsx                    operator dashboard and pixel office
+src/api/simulationEngine.ts    live planner and office workflow engine
+src/api/obsidianVault.ts       Markdown-backed memory and knowledge storage
+src/simulation/                deterministic runner, events, replay, metrics
+scenarios/                     versioned experiment fixtures
+scripts/run-scenario.ts        deterministic CLI
+tests/simulation.test.ts       replay, lifecycle, causality, and HTTP tests
+the archives/No man's AI/      bundled synthetic demo vault
+```
+
+The bundled archive is synthetic demonstration data. Do not replace it with personal, customer, or production content.
+
+## Development
+
+```bash
+npm run check
+npm test
+npm run build
+npm run ci
+npm audit
+```
+
+To rebuild walking sprites, provide a directory containing the expected named source strips:
+
+```bash
+npm run build:sprites -- ./path/to/source-strips
+```
+
+## Security and project status
+
+This is an experimental local application, not a hardened multi-user service. The API binds to `127.0.0.1` by default, and model- or vault-backed routes return `503` unless `ENABLE_LIVE_MODE=true` is set explicitly. The HTTP API has no authentication, so do not change the bind host or run live mode around sensitive data without adding access controls and reviewing the persistence model.
+
+Deterministic scenarios currently use a compact declarative action vocabulary. They do not emulate model-generated plans, token use, or full vault contents.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution expectations and [SECURITY.md](SECURITY.md) for private vulnerability reporting guidance.
+
+Released under the [MIT License](LICENSE).

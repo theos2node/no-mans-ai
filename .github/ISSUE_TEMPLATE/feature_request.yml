@@ -1,0 +1,25 @@
+name: Feature request
+description: Propose a new experiment, event contract, office behavior, or operator feature.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or research question
+      description: What should become easier to observe, reproduce, or evaluate?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the smallest useful change.
+    validations:
+      required: true
+  - type: textarea
+    id: reproducibility
+    attributes:
+      label: Reproducibility impact
+      description: Note any scenario, event schema, replay, or vault implications.

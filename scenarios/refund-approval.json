@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "id": "refund-approval",
+  "name": "Duplicate charge refund approval",
+  "seed": 424242,
+  "employees": [
+    { "id": "sam", "locationId": "react-c" },
+    { "id": "rowan-manager", "locationId": "general-manager" }
+  ],
+  "inbox": [
+    { "id": "email-duplicate-charge", "subject": "Refund request for duplicate charge", "reference": "refund-duplicate-charge" }
+  ],
+  "steps": [
+    { "id": "review-inbox", "actorId": "sam", "action": "review_email", "locationId": "customer-relations", "label": "Review duplicate-charge inbox request", "inboxId": "email-duplicate-charge" },
+    { "id": "check-policy", "actorId": "sam", "action": "read_archives", "locationId": "archives", "label": "Check refund policy in archives" },
+    { "id": "request-manager-approval", "actorId": "sam", "action": "ask_permission", "locationId": "general-manager", "label": "Request manager approval for refund", "requestKind": "approval", "requestKey": "refund-approval", "targetId": "rowan-manager" },
+    { "id": "manager-approves", "actorId": "rowan-manager", "action": "resolve_request", "locationId": "general-manager", "label": "Approve duplicate-charge refund", "requestKey": "refund-approval" },
+    { "id": "draft-response", "actorId": "sam", "action": "draft_email", "locationId": "customer-relations", "label": "Draft refund confirmation", "emailSubject": "Refund approved for duplicate charge", "inboxId": "email-duplicate-charge" },
+    { "id": "send-response", "actorId": "sam", "action": "send_email", "locationId": "customer-relations", "label": "Send refund confirmation", "emailSubject": "Refund approved for duplicate charge", "inboxId": "email-duplicate-charge", "requestKey": "refund-approval" },
+    { "id": "archive-request", "actorId": "sam", "action": "archive_note", "locationId": "archives", "label": "Archive resolved refund request", "inboxId": "email-duplicate-charge" }
+  ],
+  "goals": [
+    { "id": "manager-approval", "type": "request", "status": "approved" },
+    { "id": "refund-email", "type": "email", "subject": "Refund approved for duplicate charge" },
+    { "id": "archive-record", "type": "archived", "reference": "refund-duplicate-charge" }
+  ]
+}
