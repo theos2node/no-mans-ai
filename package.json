@@ -1,8 +1,9 @@
 {
   "name": "no-mans-ai",
   "version": "0.1.0",
-  "description": "Office simulation prototype",
-  "private": true,
+  "description": "Observable laboratory for LLM-directed office simulations",
+  "private": false,
+  "engines": { "node": ">=22.18" },
   "type": "module",
   "scripts": {
     "api": "node src/api/server.ts",
@@ -10,6 +11,9 @@
     "build": "vite build",
     "build:sprites": "node scripts/build-sprites.mjs",
     "check": "tsc --noEmit",
+    "test": "vitest run",
+    "scenario": "node scripts/run-scenario.ts",
+    "ci": "npm run check && npm test && npm run build && npm run scenario -- refund-approval --json",
     "preview": "vite preview",
     "proxy": "./scripts/run-local-openai-proxy.sh"
   },
