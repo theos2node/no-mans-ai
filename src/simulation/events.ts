@@ -193,26 +193,34 @@ export function assertCanonicalEvents(events: CanonicalEvent[]): void {
       case "request.escalated":
         exact(payload, ["requestId", "decision"], event.type);
         text(payload, "requestId", event.type);
-        text(payload, "decision", event.type);
+        if (payload.decision !== event.type.split(".")[1]) {
+          fail(`${event.type}.decision must match the event type`);
+        }
         if (event.actorId === null) fail("request decision requires actor");
         break;
       case "email.sent":
         exact(
           payload,
-          ["emailId", "subject", "inboxId", "requestKey"],
+          ["emailId", "stepId", "subject", "inboxId", "requestKey"],
           event.type,
         );
         text(payload, "emailId", event.type);
+        text(payload, "stepId", event.type);
         text(payload, "subject", event.type);
         text(payload, "inboxId", event.type);
         text(payload, "requestKey", event.type);
         if (event.actorId === null) fail("email requires actor");
         break;
       case "item.archived":
-        exact(payload, ["reference", "inboxId", "archiveId"], event.type);
+        exact(
+          payload,
+          ["archiveId", "stepId", "reference", "inboxId"],
+          event.type,
+        );
+        text(payload, "archiveId", event.type);
+        text(payload, "stepId", event.type);
         text(payload, "reference", event.type);
         text(payload, "inboxId", event.type);
-        text(payload, "archiveId", event.type);
         if (event.actorId === null) fail("archive requires actor");
         break;
       case "planner.failed":

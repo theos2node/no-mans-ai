@@ -18,8 +18,21 @@ import {
 } from "../simulation/index.ts";
 
 const PORT = Number(process.env.PORT ?? 8787);
+const HOST = process.env.HOST?.trim() || "127.0.0.1";
+const LIVE_MODE_ENABLED = process.env.ENABLE_LIVE_MODE === "true";
 const MAX_BODY_BYTES = 256 * 1024;
 const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const LIVE_PATHS = new Set([
+  "/api/status",
+  "/api/meta",
+  "/api/employees",
+  "/api/start",
+  "/api/stop",
+  "/api/reset",
+  "/api/test",
+  "/api/employees/sync",
+  "/events",
+]);
 
 function sendJson(
   response: ServerResponse,
@@ -96,6 +109,14 @@ export async function handleApiRequest(
 
   if (request.method === "GET" && pathname === "/api/health") {
     sendJson(response, 200, { ok: true });
+    return;
+  }
+
+  if (LIVE_PATHS.has(pathname) && !LIVE_MODE_ENABLED) {
+    sendJson(response, 503, {
+      error: "Live mode is disabled.",
+      hint: "Set ENABLE_LIVE_MODE=true only in a trusted local environment.",
+    });
     return;
   }
 
@@ -296,7 +317,8 @@ export const server = http.createServer(handleApiRequest);
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   server.listen(
     PORT,
-    () => console.log(`No Man's AI API listening on http://localhost:${PORT}`),
+    HOST,
+    () => console.log(`No Man's AI API listening on http://${HOST}:${PORT}`),
   );
 }
 

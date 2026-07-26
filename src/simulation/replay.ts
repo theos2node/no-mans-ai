@@ -46,6 +46,10 @@ export function validateReplay(
     string,
     { id: string; targetId: string; status: string; stepId: string }
   >();
+  const requestIds = new Set<string>();
+  const emailIds = new Set<string>();
+  const archiveIds = new Set<string>();
+  const emittedSideEffects = new Set<string>();
   const steps = new Map(scenario.steps.map((step) => [step.id, step]));
   const executed = new Set<string>();
   const drafts = new Set<string>();
@@ -85,23 +89,26 @@ export function validateReplay(
     }
     if (event.type === "request.created") {
       const key = String(event.payload.requestKey);
+      const requestId = String(event.payload.requestId);
       const step = scenario.steps.find((candidate) =>
         candidate.requestKey === key &&
         (candidate.action === "ask_permission" ||
           candidate.action === "request_review")
       );
       if (
-        requests.has(key) || !step || !executed.has(step.id) ||
+        requests.has(key) || requestIds.has(requestId) || !step ||
+        !executed.has(step.id) ||
         step.actorId !== event.actorId ||
         step.targetId !== event.payload.targetId ||
         step.requestKind !== event.payload.kind
       ) reject("invalid request creation");
       requests.set(key, {
-        id: String(event.payload.requestId),
+        id: requestId,
         targetId: String(event.payload.targetId),
         status: "pending",
         stepId: step.id,
       });
+      requestIds.add(requestId);
     }
     if (
       ["request.approved", "request.rejected", "request.escalated"].includes(
@@ -124,31 +131,37 @@ export function validateReplay(
       request.status = event.type.split(".")[1];
     }
     if (event.type === "email.sent") {
+      const emailId = String(event.payload.emailId);
       const item = inbox.get(String(event.payload.inboxId));
       const request = requests.get(String(event.payload.requestKey));
-      const step = scenario.steps.find((candidate) =>
-        candidate.action === "send_email" &&
-        candidate.inboxId === event.payload.inboxId &&
-        candidate.emailSubject === event.payload.subject &&
-        candidate.requestKey === event.payload.requestKey
-      );
+      const step = steps.get(String(event.payload.stepId));
       if (
-        !item || !step || !executed.has(step.id) ||
+        emailIds.has(emailId) || !item || !step ||
+        step.action !== "send_email" || emittedSideEffects.has(step.id) ||
+        !executed.has(step.id) ||
+        step.inboxId !== event.payload.inboxId ||
+        step.emailSubject !== event.payload.subject ||
+        step.requestKey !== event.payload.requestKey ||
         !drafts.has(`${item.id}:${event.payload.subject}`) || !request ||
         request.status !== "approved" || step.actorId !== event.actorId
       ) reject("email lacks matching inbox, draft, and approved request");
+      emailIds.add(emailId);
+      emittedSideEffects.add(step.id);
     }
     if (event.type === "item.archived") {
+      const archiveId = String(event.payload.archiveId);
       const item = inbox.get(String(event.payload.inboxId));
-      const step = scenario.steps.find((candidate) =>
-        candidate.action === "archive_note" &&
-        candidate.inboxId === event.payload.inboxId &&
-        candidate.actorId === event.actorId
-      );
+      const step = steps.get(String(event.payload.stepId));
       if (
-        !item || !step || !executed.has(step.id) ||
+        archiveIds.has(archiveId) || !item || !step ||
+        step.action !== "archive_note" || emittedSideEffects.has(step.id) ||
+        !executed.has(step.id) ||
+        step.inboxId !== event.payload.inboxId ||
+        step.actorId !== event.actorId ||
         item.reference !== event.payload.reference
       ) reject("archive does not identify matching inbox item");
+      archiveIds.add(archiveId);
+      emittedSideEffects.add(step.id);
     }
   }
   if (finished && executed.size < scenario.steps.length) {

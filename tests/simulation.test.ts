@@ -9,6 +9,8 @@ import { replayScenario } from "../src/simulation/replay.ts";
 import { validateScenario } from "../src/simulation/model.ts";
 import type { CanonicalEvent } from "../src/simulation/events.ts";
 
+process.env.ENABLE_LIVE_MODE = "false";
+
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 const fullRun = (id = "stable-run") =>
   new DeterministicSimulationRunner(scenario, id).runToCompletion();
@@ -209,6 +211,32 @@ describe("replay rejection and lifecycle validation", () => {
     archive.payload.inboxId = "wrong-item";
     expect(() => replayScenario(scenario, badArchive)).toThrow();
   });
+
+  it("rejects contradictory decisions and duplicate side effects", () => {
+    const result = fullRun("semantic-run");
+    const contradictory = clone(result.events);
+    const decision = contradictory.find((event) =>
+      event.type === "request.approved"
+    )!;
+    decision.payload.decision = "rejected";
+    expect(() => replayScenario(scenario, contradictory)).toThrow(/decision/);
+
+    for (const type of ["email.sent", "item.archived"] as const) {
+      const duplicated = clone(result.events);
+      const finish = duplicated.pop()!;
+      const duplicate = clone(
+        duplicated.find((event) => event.type === type)!,
+      );
+      duplicate.tick = finish.tick;
+      if (type === "email.sent") {
+        duplicate.payload.emailId = "duplicate-email-id";
+      } else {
+        duplicate.payload.archiveId = "duplicate-archive-id";
+      }
+      duplicated.push(duplicate, finish);
+      expect(() => replayScenario(scenario, resequence(duplicated))).toThrow();
+    }
+  });
 });
 
 describe("experiment API integration", () => {
@@ -306,6 +334,9 @@ describe("experiment API integration", () => {
       throw new Error("server did not bind");
     }
     const base = `http://127.0.0.1:${address.port}`;
+    const disabledLiveRoute = await fetch(`${base}/api/status`);
+    expect(disabledLiveRoute.status).toBe(503);
+    expect(isLiveRuntimeInitialized()).toBe(false);
     const invalid = await fetch(`${base}/api/runs`, {
       method: "POST",
       headers: { "content-type": "application/json" },

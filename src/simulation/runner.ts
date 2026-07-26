@@ -368,6 +368,7 @@ export class DeterministicSimulationRunner {
     if (step.action === "send_email") {
       this.emit("email.sent", step.actorId, {
         emailId: this.ids.next("email"),
+        stepId: step.id,
         subject: step.emailSubject!,
         inboxId: step.inboxId!,
         requestKey: step.requestKey!,
@@ -379,9 +380,10 @@ export class DeterministicSimulationRunner {
       );
       if (!item) throw new Error(`No inbox item ${step.inboxId}`);
       this.emit("item.archived", step.actorId, {
+        archiveId: this.ids.next("archive"),
+        stepId: step.id,
         reference: item.reference,
         inboxId: item.id,
-        archiveId: this.ids.next("archive"),
       });
     }
   }

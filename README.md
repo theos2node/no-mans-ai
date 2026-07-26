@@ -62,6 +62,8 @@ Open [http://localhost:5173](http://localhost:5173). The API listens on port `87
 | `PLANNER_RETRY_BACKOFF_MS` | Cooldown after planner failures |
 | `OPENAI_INPUT_COST_PER_1M` | Optional dashboard cost estimate |
 | `OPENAI_OUTPUT_COST_PER_1M` | Optional dashboard cost estimate |
+| `ENABLE_LIVE_MODE` | Explicitly enables model- and vault-backed routes |
+| `HOST` | API bind host; defaults to `127.0.0.1` |
 
 The planner queue is serialized, throttled, retried with backoff, and cooled by a circuit breaker so a local model is not hit concurrently or in a tight failure loop.
 
@@ -161,7 +163,7 @@ npm run build:sprites -- ./path/to/source-strips
 
 ## Security and project status
 
-This is an experimental local application, not a hardened multi-user service. The HTTP API has no authentication, and live mode can write to the configured vault. Do not expose it to an untrusted network or run it against sensitive data without adding access controls and reviewing the persistence model.
+This is an experimental local application, not a hardened multi-user service. The API binds to `127.0.0.1` by default, and model- or vault-backed routes return `503` unless `ENABLE_LIVE_MODE=true` is set explicitly. The HTTP API has no authentication, so do not change the bind host or run live mode around sensitive data without adding access controls and reviewing the persistence model.
 
 Deterministic scenarios currently use a compact declarative action vocabulary. They do not emulate model-generated plans, token use, or full vault contents.
 
